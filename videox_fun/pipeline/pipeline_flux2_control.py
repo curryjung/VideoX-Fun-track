@@ -30,8 +30,13 @@ from diffusers.utils import (is_torch_xla_available, logging,
                              replace_example_docstring)
 from diffusers.utils.torch_utils import randn_tensor
 
-from ..models import (AutoencoderKLFlux2, Flux2ImageProcessor,
+try:
+    from ..models import (AutoencoderKLFlux2, Flux2ImageProcessor,
                       Flux2ControlTransformer2DModel, Mistral3ForConditionalGeneration, AutoProcessor)
+except Exception:
+    from ..models import (AutoencoderKLFlux2, Flux2ImageProcessor,
+                          Flux2ControlTransformer2DModel,AutoProcessor)
+    Mistral3ForConditionalGeneration = None
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm

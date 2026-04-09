@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${REPO_ROOT}"
+
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+MODEL_NAME="${MODEL_NAME:-models/Diffusion_Transformer/Wan2.1-Fun-V1.1-1.3B-InP}"
+CONFIG_PATH="${CONFIG_PATH:-config/wan2.1/wan_civitai.yaml}"
+TRANSFORMER_CHECKPOINT_PATH="${TRANSFORMER_CHECKPOINT_PATH:-}"
+
+PROMPT="${PROMPT:-a woman walking in a park, cinematic lighting}"
+NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-worst quality, low quality, blurry, static frame}"
+VALIDATION_IMAGE_START="${VALIDATION_IMAGE_START:-asset/1.png}"
+VALIDATION_IMAGE_END="${VALIDATION_IMAGE_END:-}"
+TRACK_FILE_PATH="${TRACK_FILE_PATH:-}"
+# Set TRACK_NORMALIZE=true only when track npz stores [0,1] normalized coords (training --track_normalize).
+# Preprocess outputs are often already pixel coords in 832x480 — do NOT set normalize in that case.
+TRACK_NORMALIZE="${TRACK_NORMALIZE:-true}"
+OVERLAY_LINEWIDTH="${OVERLAY_LINEWIDTH:-2}"
+OVERLAY_TRACE_FRAMES="${OVERLAY_TRACE_FRAMES:--1}"
+OVERLAY_PAD_VALUE="${OVERLAY_PAD_VALUE:-0}"
+COTRACKER_ROOT="${COTRACKER_ROOT:-/data/project-vilab/jaeseok/co-tracker}"
+METADATA_PATH="${METADATA_PATH:-}"
+SAMPLE_INDEX="${SAMPLE_INDEX:-0}"
+RANDOM_SAMPLE="${RANDOM_SAMPLE:-false}"
+TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-}"
+TRAIN_DATA_ROOT_MAP_JSON_TRACK="${TRAIN_DATA_ROOT_MAP_JSON_TRACK:-}"
+TRAIN_DATA_ROOT_ID_KEY_TRACK="${TRAIN_DATA_ROOT_ID_KEY_TRACK:-root_id}"
+USE_PROMPT_FROM_METADATA="${USE_PROMPT_FROM_METADATA:-true}"
+TEXT_FEATURE_PATH="${TEXT_FEATURE_PATH:-}"
+NEGATIVE_TEXT_FEATURE_PATH="${NEGATIVE_TEXT_FEATURE_PATH:-}"
+CLIP_FEATURE_PATH="${CLIP_FEATURE_PATH:-}"
+# DEBUG_TRACK_CONDITION=true → print tensors only (no pdb).
+# PDB_TRACK_CONDITION=true → stop once in pdb before pipeline() (needs interactive TTY).
+# PDB_PIPELINE_STEP0=true → stop in pdb at first denoise step before transformer forward.
+DEBUG_TRACK_CONDITION="${DEBUG_TRACK_CONDITION:-false}"
+PDB_TRACK_CONDITION="${PDB_TRACK_CONDITION:-false}"
+PDB_PIPELINE_STEP0="${PDB_PIPELINE_STEP0:-false}"
+FORCE_TRACK_CONDITION_NONE="${FORCE_TRACK_CONDITION_NONE:-false}"
+RANDOM_FAKE_TRACK="${RANDOM_FAKE_TRACK:-false}"
+TRACK_LATENT_SCALE="${TRACK_LATENT_SCALE:-1.0}"
+
+SAVE_DIR="${SAVE_DIR:-samples/wan-videos-fun-i2v-track}"
+OUTPUT_NAME_SUFFIX="${OUTPUT_NAME_SUFFIX:-}"
+
+if [[ -z "${OUTPUT_NAME_SUFFIX}" ]]; then
+  TRACK_MODE_SUFFIX="track_on"
+  if [[ "${FORCE_TRACK_CONDITION_NONE}" == "true" ]]; then
+    TRACK_MODE_SUFFIX="track_off"
+  elif [[ "${RANDOM_FAKE_TRACK}" == "true" ]]; then
+    TRACK_MODE_SUFFIX="track_fake"
+  fi
+  TRACK_POINTS_SUFFIX="pall"
+  if [[ -n "${TRACK_MAX_POINTS:-}" && "${TRACK_MAX_POINTS}" != "-1" ]]; then
+    TRACK_POINTS_SUFFIX="p${TRACK_MAX_POINTS}"
+  fi
+  OUTPUT_NAME_SUFFIX="${TRACK_MODE_SUFFIX}_${TRACK_POINTS_SUFFIX}"
+fi
+
+echo "[trace_exec] run_predict_i2v_track.sh"
+echo "[trace_exec] repo_root=${REPO_ROOT}"
+echo "[trace_exec] python_bin=${PYTHON_BIN}"
+echo "[trace_exec] validation_image_start=${VALIDATION_IMAGE_START}"
+echo "[trace_exec] track_file_path=${TRACK_FILE_PATH:-<empty>}"
+echo "[trace_exec] text_feature_path=${TEXT_FEATURE_PATH:-<empty>}"
+echo "[trace_exec] clip_feature_path=${CLIP_FEATURE_PATH:-<empty>}"
+echo "[trace_exec] metadata_path=${METADATA_PATH:-<empty>}"
+echo "[trace_exec] debug_track_condition=${DEBUG_TRACK_CONDITION} pdb_track_condition=${PDB_TRACK_CONDITION} pdb_pipeline_step0=${PDB_PIPELINE_STEP0}"
+echo "[trace_exec] force_track_condition_none=${FORCE_TRACK_CONDITION_NONE}"
+echo "[trace_exec] random_fake_track=${RANDOM_FAKE_TRACK}"
+echo "[trace_exec] track_latent_scale=${TRACK_LATENT_SCALE}"
+echo "[trace_exec] output_name_suffix=${OUTPUT_NAME_SUFFIX}"
+
+EXTRA_ARGS=()
+if [[ -n "${TRANSFORMER_CHECKPOINT_PATH}" ]]; then
+  EXTRA_ARGS+=("--transformer_checkpoint_path=${TRANSFORMER_CHECKPOINT_PATH}")
+fi
+if [[ -n "${VALIDATION_IMAGE_END}" ]]; then
+  EXTRA_ARGS+=("--validation_image_end=${VALIDATION_IMAGE_END}")
+fi
+if [[ -n "${VALIDATION_IMAGE_START}" ]]; then
+  EXTRA_ARGS+=("--validation_image_start=${VALIDATION_IMAGE_START}")
+fi
+if [[ -n "${TRACK_FILE_PATH}" ]]; then
+  EXTRA_ARGS+=("--track_file_path=${TRACK_FILE_PATH}")
+fi
+if [[ -n "${TRACK_MAX_POINTS:-}" ]]; then
+  EXTRA_ARGS+=("--track_max_points=${TRACK_MAX_POINTS}")
+fi
+if [[ "${TRACK_NORMALIZE}" == "true" ]]; then
+  EXTRA_ARGS+=("--normalize_track")
+fi
+if [[ -n "${METADATA_PATH}" ]]; then
+  EXTRA_ARGS+=("--metadata_path=${METADATA_PATH}" "--sample_index=${SAMPLE_INDEX}")
+fi
+if [[ "${RANDOM_SAMPLE}" == "true" ]]; then
+  EXTRA_ARGS+=("--random_sample")
+fi
+if [[ -n "${TRAIN_DATA_DIR}" ]]; then
+  EXTRA_ARGS+=("--train_data_dir=${TRAIN_DATA_DIR}")
+fi
+if [[ -n "${TRAIN_DATA_ROOT_MAP_JSON_TRACK}" ]]; then
+  EXTRA_ARGS+=("--train_data_root_map_json_track=${TRAIN_DATA_ROOT_MAP_JSON_TRACK}")
+fi
+if [[ -n "${TRAIN_DATA_ROOT_ID_KEY_TRACK}" ]]; then
+  EXTRA_ARGS+=("--train_data_root_id_key_track=${TRAIN_DATA_ROOT_ID_KEY_TRACK}")
+fi
+if [[ "${USE_PROMPT_FROM_METADATA}" == "true" ]]; then
+  EXTRA_ARGS+=("--use_prompt_from_metadata")
+fi
+if [[ -n "${TEXT_FEATURE_PATH}" ]]; then
+  EXTRA_ARGS+=("--text_feature_path=${TEXT_FEATURE_PATH}")
+fi
+if [[ -n "${NEGATIVE_TEXT_FEATURE_PATH}" ]]; then
+  EXTRA_ARGS+=("--negative_text_feature_path=${NEGATIVE_TEXT_FEATURE_PATH}")
+fi
+if [[ -n "${CLIP_FEATURE_PATH}" ]]; then
+  EXTRA_ARGS+=("--clip_feature_path=${CLIP_FEATURE_PATH}")
+fi
+EXTRA_ARGS+=("--overlay_linewidth=${OVERLAY_LINEWIDTH}" "--overlay_trace_frames=${OVERLAY_TRACE_FRAMES}")
+if [[ -n "${COTRACKER_ROOT}" ]]; then
+  EXTRA_ARGS+=("--cotracker_root=${COTRACKER_ROOT}")
+fi
+EXTRA_ARGS+=("--overlay_pad_value=${OVERLAY_PAD_VALUE}")
+if [[ "${DEBUG_TRACK_CONDITION}" == "true" ]]; then
+  EXTRA_ARGS+=("--debug_track_condition")
+fi
+if [[ "${PDB_TRACK_CONDITION}" == "true" ]]; then
+  EXTRA_ARGS+=("--pdb_track_condition")
+fi
+if [[ "${PDB_PIPELINE_STEP0}" == "true" ]]; then
+  EXTRA_ARGS+=("--pdb_pipeline_step0")
+fi
+if [[ "${FORCE_TRACK_CONDITION_NONE}" == "true" ]]; then
+  EXTRA_ARGS+=("--force_track_condition_none")
+fi
+if [[ "${RANDOM_FAKE_TRACK}" == "true" ]]; then
+  EXTRA_ARGS+=("--random_fake_track")
+fi
+if [[ -n "${TRACK_LATENT_SCALE}" ]]; then
+  EXTRA_ARGS+=("--track_latent_scale=${TRACK_LATENT_SCALE}")
+fi
+
+printf '[trace_exec] python argv extras:'
+for arg in "${EXTRA_ARGS[@]}"; do
+  printf ' %q' "${arg}"
+done
+printf '\n'
+
+"${PYTHON_BIN}" examples/wan2.1_fun_track/predict_i2v_track.py \
+  --config_path="${CONFIG_PATH}" \
+  --model_name="${MODEL_NAME}" \
+  --prompt="${PROMPT}" \
+  --negative_prompt="${NEGATIVE_PROMPT}" \
+  --save_dir="${SAVE_DIR}" \
+  --output_name_suffix="${OUTPUT_NAME_SUFFIX}" \
+  "${EXTRA_ARGS[@]}"

@@ -1,6 +1,9 @@
 from .dataset_image import CC15M, ImageEditDataset
 from .dataset_image_video import (ImageVideoControlDataset, ImageVideoDataset,
                                   ImageVideoSampler, TextDataset)
+from .dataset_image_video_track import (ImageVideoDatasetTrack,
+                                        ImageVideoLatentTrackDataset,
+                                        DummyTrackLatentDataset)
 from .dataset_video import (VideoAnimateDataset, VideoDataset,
                             VideoSpeechDataset, WebVid10M)
 from .utils import (VIDEO_READER_TIMEOUT, Camera, VideoReader_contextmanager,

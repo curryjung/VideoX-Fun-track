@@ -1,0 +1,113 @@
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: wan2-track-20260409-a
+  namespace: p-video-generation
+  annotations:
+    mlx.navercorp.com/zone: "private-clush"
+
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+    ttlSecondsAfterFinished: 1814400
+
+  # torchrun --nproc_per_node
+  nprocPerNode: "8"
+
+  elasticPolicy:
+    rdzvId: wan2-track-20260409-a
+    rdzvBackend: c10d
+    minReplicas: 2
+    maxReplicas: 2
+    maxRestarts: 3
+
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 2
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+            mlx.navercorp.com/zone: "private-clush"
+        spec:
+          serviceAccountName: default-editor
+          nodeSelector:
+            mlx.navercorp.com/zone: "private-clush"
+
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: training.kubeflow.org/job-name
+                        operator: In
+                        values:
+                          - wan2-track-20260409-a
+                  topologyKey: kubernetes.io/hostname
+
+
+          containers:
+            - name: pytorch
+              image: <registry>/<repo>/videox-fun:<tag>
+              imagePullPolicy: IfNotPresent
+              command: ["bash", "-c"]
+              args:
+                - >
+                  cd /data/project-vilab/jaeseok/VideoX-Fun &&
+                  bash scripts/wan2.1_fun_track/train_execution_pytorchjob.sh
+              env:
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: TORCH_DISTRIBUTED_DEBUG
+                  value: "DETAIL"
+                - name: TORCH_CPP_LOG_LEVEL
+                  value: "INFO"
+                - name: GLOO_SOCKET_FAMILY
+                  value: "AF_INET"
+                # Optional NIC hint (edit to your cluster interface if needed)
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth0"
+
+                # Optional run overrides (script defaults can be overridden here)
+                - name: MIXED_PRECISION_TRACK
+                  value: "bf16"
+                - name: GRADIENT_CHECKPOINTING_TRACK
+                  value: "true"
+                - name: CHECKPOINTING_STEPS_TRACK
+                  value: "200"
+                - name: VALIDATION_STEPS_TRACK
+                  value: "200"
+
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+
+              resources:
+                requests:
+                  cpu: "16"
+                  memory: "128Gi"
+                  nvidia.com/gpu: "8"
+                limits:
+                  cpu: "16"
+                  memory: "128Gi"
+                  nvidia.com/gpu: "8"
+
+              volumeMounts:
+                - name: shared-memory
+                  mountPath: /dev/shm
+                - name: project-vilab
+                  mountPath: /data/project-vilab
+                - name: shared-vilab
+                  mountPath: /data/shared-vilab
+
+          volumes:
+            - name: shared-memory
+              emptyDir:
+                medium: Memory
+            - name: project-vilab
+              persistentVolumeClaim:
+                claimName: project-vilab
+            - name: shared-vilab
+              persistentVolumeClaim:
+                claimName: shared-vilab

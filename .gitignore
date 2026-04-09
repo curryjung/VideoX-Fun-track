@@ -168,3 +168,13 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Local training/inference artifacts
+checkpoints/
+wandb/
+vis_tracks_on_decoded_reference.mp4
+
+# Track builder local environments/build outputs
+track_builder_ui/backend/.venv/
+track_builder_ui/frontend/node_modules/
+track_builder_ui/frontend/dist/

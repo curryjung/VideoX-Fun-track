@@ -1,0 +1,11 @@
+python "examples/wan2.1_fun_track/overlay_latent_reference_track.py" \
+  --sample_dir "/data/project-vilab/jaeseok/VideoX-Fun/asset/--oP9WWSIas_0_604to1168/processed_832x480_fps16" \
+  --config_path "config/wan2.1/wan_civitai.yaml" \
+  --model_name "models/Diffusion_Transformer/Wan2.1-Fun-V1.1-1.3B-InP" \
+  --cotracker_root "/data/project-vilab/jaeseok/co-tracker" \
+  --fps 16 \
+  --linewidth 1 \
+  --trace_frames 8 \
+  --max_points -1 \
+  --point_sample_mode top_motion \
+  --mixed_precision bf16

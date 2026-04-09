@@ -4,13 +4,18 @@ from diffusers import AutoencoderKL
 from transformers import (AutoProcessor, AutoTokenizer, CLIPImageProcessor,
                           CLIPTextModel, CLIPTokenizer,
                           CLIPVisionModelWithProjection,
-                          Gemma3ForConditionalGeneration, GemmaTokenizer,
                           GemmaTokenizerFast, LlamaModel, LlamaTokenizerFast,
                           LlavaForConditionalGeneration,
-                          Mistral3ForConditionalGeneration, PixtralProcessor,
-                          Qwen3Config, Qwen3ForCausalLM, T5EncoderModel,
-                          T5Tokenizer, T5TokenizerFast, UMT5EncoderModel,
-                          Wav2Vec2FeatureExtractor)
+                          T5Tokenizer, T5TokenizerFast, UMT5EncoderModel, T5EncoderModel,
+                          Wav2Vec2FeatureExtractor
+                          )
+
+try:
+    from transformers import (Gemma3ForConditionalGeneration, GemmaTokenizer,
+    Qwen3Config, Qwen3ForCausalLM, 
+    Mistral3ForConditionalGeneration, PixtralProcessor)
+except Exception:
+    Gemma3ForConditionalGeneration, GemmaTokenizer, Qwen3Config, Qwen3ForCausalLM, Mistral3ForConditionalGeneration, PixtralProcessor = None, None, None, None, None, None
 
 try:
     from transformers import (Qwen2_5_VLConfig,
@@ -59,6 +64,7 @@ from .wan_image_encoder import CLIPModel
 from .wan_text_encoder import WanT5EncoderModel
 from .wan_transformer3d import (Wan2_2Transformer3DModel, WanRMSNorm,
                                 WanSelfAttention, WanTransformer3DModel)
+from .wan_transformer3d_track import WanTransformer3DModelTrack
 from .wan_transformer3d_animate import Wan2_2Transformer3DModel_Animate
 from .wan_transformer3d_s2v import Wan2_2Transformer3DModel_S2V
 from .wan_transformer3d_vace import VaceWanTransformer3DModel

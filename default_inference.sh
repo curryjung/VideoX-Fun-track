@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=5 torchrun --nproc-per-node=1 examples/wan2.1_fun/predict_i2v.py

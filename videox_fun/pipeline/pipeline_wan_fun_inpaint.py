@@ -18,6 +18,7 @@ from diffusers.video_processor import VideoProcessor
 from einops import rearrange
 from PIL import Image
 from transformers import T5Tokenizer
+import os
 
 from ..models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
                               WanT5EncoderModel, WanTransformer3DModel)
@@ -494,9 +495,11 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         clip_image: Image = None,
+        clip_feature: Optional[torch.FloatTensor] = None,
         max_sequence_length: int = 512,
         comfyui_progressbar: bool = False,
         shift: int = 5,
+        track_condition: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Union[WanPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -507,6 +510,7 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         Returns:
 
         """
+
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
@@ -543,7 +547,7 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt( # [[token_length, 4096],... ], [[token_length, 4096],... ]
             prompt,
             negative_prompt,
             do_classifier_free_guidance,
@@ -612,10 +616,10 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                 bs, _, video_length, height, width = video.size()
                 mask_condition = self.mask_processor.preprocess(rearrange(mask_video, "b c f h w -> (b f) c h w"), height=height, width=width) 
                 mask_condition = mask_condition.to(dtype=torch.float32)
-                mask_condition = rearrange(mask_condition, "(b f) c h w -> b c f h w", f=video_length)
+                mask_condition = rearrange(mask_condition, "(b f) c h w -> b c f h w", f=video_length) # [1, 1, 81, 480, 832]
 
-                masked_video = init_video * (torch.tile(mask_condition, [1, 3, 1, 1, 1]) < 0.5)
-                _, masked_video_latents = self.prepare_mask_latents(
+                masked_video = init_video * (torch.tile(mask_condition, [1, 3, 1, 1, 1]) < 0.5) # [1, 3, 81, 480, 720]
+                _, masked_video_latents = self.prepare_mask_latents( # [1, 16, 21, 60, 104]
                     None,
                     masked_video,
                     batch_size,
@@ -628,18 +632,22 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                     noise_aug_strength=None,
                 )
                 
-                mask_condition = torch.concat(
+                mask_condition = torch.concat( # [1, 1, 84, 480, 832]
                     [
                         torch.repeat_interleave(mask_condition[:, :, 0:1], repeats=4, dim=2), 
                         mask_condition[:, :, 1:]
                     ], dim=2
                 )
-                mask_condition = mask_condition.view(bs, mask_condition.shape[2] // 4, 4, height, width)
-                mask_condition = mask_condition.transpose(1, 2)
-                mask_latents = resize_mask(1 - mask_condition, masked_video_latents, True).to(device, weight_dtype) 
+                mask_condition = mask_condition.view(bs, mask_condition.shape[2] // 4, 4, height, width) # [1, 21, 4, 480, 832]
+                mask_condition = mask_condition.transpose(1, 2) # [1, 4, 21, 480, 832]
+                mask_latents = resize_mask(1 - mask_condition, masked_video_latents, True).to(device, weight_dtype)  # [1, 4, 21, 60, 104]
 
-        # Prepare clip latent variables
-        if clip_image is not None:
+        # Prepare clip latent variables (allow external precomputed feature override).
+        if clip_feature is not None:
+            if clip_feature.ndim == 2:
+                clip_feature = clip_feature.unsqueeze(0)
+            clip_context = clip_feature.to(device=device, dtype=weight_dtype)
+        elif clip_image is not None:
             clip_image = TF.to_tensor(clip_image).sub_(0.5).div_(0.5).to(device, weight_dtype) 
             clip_context = self.clip_image_encoder([clip_image[:, None, :, :]])
         else:
@@ -658,6 +666,69 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         # 7. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self.transformer.num_inference_steps = num_inference_steps
+
+        track_condition_base = None
+        if track_condition is not None:
+            tracks = track_condition.get("tracks", None)
+            visibility = track_condition.get("visibility", None)
+            point_mask = track_condition.get("point_mask", None)
+            if tracks is not None and visibility is not None:
+                tracks = tracks.to(device=device, dtype=torch.float32)
+                visibility = visibility.to(device=device, dtype=torch.float32)
+                if tracks.ndim == 3:
+                    tracks = tracks.unsqueeze(0)
+                if visibility.ndim == 2:
+                    visibility = visibility.unsqueeze(0)
+
+                expected_batch = batch_size * num_videos_per_prompt
+                if tracks.shape[0] == 1 and expected_batch > 1:
+                    tracks = tracks.expand(expected_batch, -1, -1, -1).contiguous()
+                    visibility = visibility.expand(expected_batch, -1, -1).contiguous()
+                    if point_mask is not None and point_mask.ndim == 2 and point_mask.shape[0] == 1:
+                        point_mask = point_mask.expand(expected_batch, -1).contiguous()
+                elif tracks.shape[0] != expected_batch:
+                    raise ValueError(
+                        f"track_condition batch={tracks.shape[0]} does not match expected batch={expected_batch}."
+                    )
+
+                if point_mask is not None:
+                    point_mask = point_mask.to(device=device, dtype=torch.bool)
+                    if point_mask.ndim == 1:
+                        point_mask = point_mask.unsqueeze(0)
+                    if point_mask.shape[0] == 1 and expected_batch > 1:
+                        point_mask = point_mask.expand(expected_batch, -1).contiguous()
+                    elif point_mask.shape[0] != expected_batch:
+                        raise ValueError(
+                            f"track_condition.point_mask batch={point_mask.shape[0]} "
+                            f"does not match expected batch={expected_batch}."
+                        )
+
+                track_condition_base = {
+                    "tracks": tracks,
+                    "visibility": visibility,
+                }
+                if point_mask is not None:
+                    track_condition_base["point_mask"] = point_mask
+
+                track_res = track_condition.get("track_resolution", None)
+                if track_res is not None:
+                    track_res = track_res.to(device=device, dtype=torch.float32)
+                    if track_res.ndim == 1:
+                        track_res = track_res.unsqueeze(0)
+                    if track_res.ndim != 2 or track_res.shape[-1] != 2:
+                        raise ValueError(
+                            "track_condition.track_resolution must be [2] or [B,2] with [width,height], "
+                            f"got {tuple(track_res.shape)}"
+                        )
+                    if track_res.shape[0] == 1 and expected_batch > 1:
+                        track_res = track_res.expand(expected_batch, -1).contiguous()
+                    elif track_res.shape[0] != expected_batch:
+                        raise ValueError(
+                            f"track_resolution batch={track_res.shape[0]} does not match "
+                            f"tracks batch={expected_batch}."
+                        )
+                    track_condition_base["track_resolution"] = track_res
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 self.transformer.current_steps = i
@@ -676,22 +747,93 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                     )
                     y = torch.cat([mask_input, masked_video_latents_input], dim=1).to(device, weight_dtype) 
 
-                clip_context_input = (
+                clip_context_input = ( # [2, 257, 1280]
                     torch.cat([clip_context] * 2) if do_classifier_free_guidance else clip_context
                 )
+                track_condition_input = None
+                if track_condition_base is not None:
+                    if do_classifier_free_guidance:
+                        # CFG: keep track conditioning only on the conditional branch.
+                        # Unconditional half receives zeros/None semantics by zeroing the
+                        # tensors while preserving batch shape for the transformer call.
+                        track_condition_input = {
+                            "tracks": torch.cat(
+                                [
+                                    torch.zeros_like(track_condition_base["tracks"]),
+                                    track_condition_base["tracks"],
+                                ],
+                                dim=0,
+                            ),
+                            "visibility": torch.cat(
+                                [
+                                    torch.zeros_like(track_condition_base["visibility"]),
+                                    track_condition_base["visibility"],
+                                ],
+                                dim=0,
+                            ),
+                        }
+                        if "point_mask" in track_condition_base:
+                            track_condition_input["point_mask"] = torch.cat(
+                                [
+                                    torch.zeros_like(track_condition_base["point_mask"]),
+                                    track_condition_base["point_mask"],
+                                ],
+                                dim=0,
+                            )
+                        if "track_resolution" in track_condition_base:
+                            tr = track_condition_base["track_resolution"]
+                            track_condition_input["track_resolution"] = torch.cat([tr, tr], dim=0)
+                    else:
+                        track_condition_input = track_condition_base
+
+                if i == 0 and os.environ.get("WAN_DEBUG_TRACK_CONDITION") == "1":
+                    b_latent = latent_model_input.shape[0]
+                    if track_condition_input is None:
+                        print(
+                            "[debug_track] pipeline step0: track_condition_input=None "
+                            f"(CFG={do_classifier_free_guidance}, latent_batch={b_latent})"
+                        )
+                    else:
+                        print(
+                            "[debug_track] pipeline step0: "
+                            f"keys={sorted(track_condition_input.keys())} "
+                            f"CFG={do_classifier_free_guidance} latent_batch={b_latent}"
+                        )
+                        for _k, _v in sorted(track_condition_input.items()):
+                            if isinstance(_v, torch.Tensor):
+                                print(
+                                    f"  {_k}: shape={tuple(_v.shape)} dtype={_v.dtype} "
+                                    f"device={_v.device}"
+                                )
+                            else:
+                                print(f"  {_k}: {_v!r}")
+
+                if i == 0 and os.environ.get("PDB_PIPELINE_STEP0", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                ):
+                    print(
+                        "[pdb] pipeline step0: before transformer forward — "
+                        "latent_model_input, track_condition_input, y, clip_context_input, …",
+                        flush=True,
+                    )
+                    breakpoint()
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
-                
+
                 # predict noise model_output
                 with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=device):
                     noise_pred = self.transformer(
-                        x=latent_model_input,
-                        context=in_prompt_embeds,
-                        t=timestep,
-                        seq_len=seq_len,
-                        y=y,
+                        x=latent_model_input, # [2, 16, 21, 60, 104], noisy latents image
+                        context=in_prompt_embeds, # [[126, 4096], [71, 4096]], text embedding
+                        t=timestep, 
+                        seq_len=seq_len, 
+                        y=y, # [2, 20, 21, 60, 104]
                         clip_fea=clip_context_input,
+                        track_condition=track_condition_input,
                     )
 
                 # perform guidance

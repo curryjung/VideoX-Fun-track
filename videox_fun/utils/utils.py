@@ -268,6 +268,8 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 def get_image_to_video_latent(validation_image_start, validation_image_end, video_length, sample_size):
+    
+
     if validation_image_start is not None and validation_image_end is not None:
         if type(validation_image_start) is str and os.path.isfile(validation_image_start):
             image_start = clip_image = Image.open(validation_image_start).convert("RGB")
@@ -344,12 +346,13 @@ def get_image_to_video_latent(validation_image_start, validation_image_end, vide
             input_video_mask = torch.zeros_like(input_video[:, :1])
             input_video_mask[:, :, len(image_start):] = 255
         else:
+            # np.array(image_start).shape: [height, width, 3]
             input_video = torch.tile(
                 torch.from_numpy(np.array(image_start)).permute(2, 0, 1).unsqueeze(1).unsqueeze(0), 
                 [1, 1, video_length, 1, 1]
-            ) / 255
-            input_video_mask = torch.zeros_like(input_video[:, :1])
-            input_video_mask[:, :, 1:, ] = 255
+            ) / 255 # [1, 3, video_length, height, width], (0,1)
+            input_video_mask = torch.zeros_like(input_video[:, :1]) #[1, 1, video_length, height, width], 
+            input_video_mask[:, :, 1:, ] = 255 
     else:
         image_start = None
         image_end = None

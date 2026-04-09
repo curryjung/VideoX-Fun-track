@@ -814,6 +814,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         # if self.model_type == 'i2v':
         #     assert clip_fea is not None and y is not None
         # params
+
         device = self.patch_embedding.weight.device
         dtype = x.dtype
         if self.freqs.device != device and torch.device(type="meta") != device:
@@ -1162,7 +1163,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
                 if model.state_dict()['patch_embedding.weight'].size() != state_dict['patch_embedding.weight'].size():
                     model.state_dict()['patch_embedding.weight'][:, :state_dict['patch_embedding.weight'].size()[1], :, :] = state_dict['patch_embedding.weight'][:, :model.state_dict()['patch_embedding.weight'].size()[1], :, :]
-                    model.state_dict()['patch_embedding.weight'][:, state_dict['patch_embedding.weight'].size()[1]:, :, :] = 0
                     state_dict['patch_embedding.weight'] = model.state_dict()['patch_embedding.weight']
 
                 filtered_state_dict = {}
@@ -1268,7 +1268,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         
         if model.state_dict()['patch_embedding.weight'].size() != state_dict['patch_embedding.weight'].size():
             model.state_dict()['patch_embedding.weight'][:, :state_dict['patch_embedding.weight'].size()[1], :, :] = state_dict['patch_embedding.weight'][:, :model.state_dict()['patch_embedding.weight'].size()[1], :, :]
-            model.state_dict()['patch_embedding.weight'][:, state_dict['patch_embedding.weight'].size()[1]:, :, :] = 0
             state_dict['patch_embedding.weight'] = model.state_dict()['patch_embedding.weight']
         
         tmp_state_dict = {} 

@@ -1,0 +1,1230 @@
+import React, { useEffect, useMemo, useState } from "react";
+import JSZip from "jszip";
+import TrackCanvas from "./components/TrackCanvas";
+import TrackPreview from "./components/TrackPreview";
+import type { GridConfig, TrackDocument, TrackPath } from "./types";
+
+const FRAME_COUNT = 81;
+const DEFAULT_IMAGE_WIDTH = 832;
+const DEFAULT_IMAGE_HEIGHT = 480;
+const BACKEND_BASE_URL =
+  (import.meta.env.VITE_BACKEND_URL as string | undefined)?.trim() ?? "";
+const DEFAULT_FLORENCE_TASK = "<MORE_DETAILED_CAPTION>";
+
+function buildApiUrl(path: string): string {
+  if (!BACKEND_BASE_URL) {
+    return path;
+  }
+  const base = BACKEND_BASE_URL.endsWith("/")
+    ? BACKEND_BASE_URL.slice(0, -1)
+    : BACKEND_BASE_URL;
+  return `${base}${path}`;
+}
+
+function generatePathId(): string {
+  return `path-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function loadHtmlImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Failed to load image"));
+    image.src = src;
+  });
+}
+
+function drawCenterCropCover(
+  ctx: CanvasRenderingContext2D,
+  source: HTMLImageElement,
+  width: number,
+  height: number
+): void {
+  const sourceWidth = source.width;
+  const sourceHeight = source.height;
+  if (sourceWidth <= 0 || sourceHeight <= 0) {
+    return;
+  }
+
+  const sourceAspect = sourceWidth / sourceHeight;
+  const targetAspect = width / height;
+
+  let sx = 0;
+  let sy = 0;
+  let sw = sourceWidth;
+  let sh = sourceHeight;
+
+  if (sourceAspect > targetAspect) {
+    sw = sourceHeight * targetAspect;
+    sx = (sourceWidth - sw) / 2;
+  } else {
+    sh = sourceWidth / targetAspect;
+    sy = (sourceHeight - sh) / 2;
+  }
+
+  ctx.drawImage(source, sx, sy, sw, sh, 0, 0, width, height);
+}
+
+function createSquareGridPoints(
+  rows: number,
+  cols: number,
+  spacing: number,
+  canvasWidth: number,
+  canvasHeight: number
+): { x: number; y: number }[] {
+  const totalWidth = (cols - 1) * spacing;
+  const totalHeight = (rows - 1) * spacing;
+  const startX = canvasWidth / 2 - totalWidth / 2;
+  const startY = canvasHeight / 2 - totalHeight / 2;
+
+  const points: { x: number; y: number }[] = [];
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      points.push({
+        x: startX + c * spacing,
+        y: startY + r * spacing
+      });
+    }
+  }
+  return points;
+}
+
+function createCirclePoints(
+  pointCount: number,
+  spacing: number,
+  canvasWidth: number,
+  canvasHeight: number
+): { x: number; y: number }[] {
+  const count = Math.max(1, pointCount);
+  const centerX = canvasWidth / 2;
+  const centerY = canvasHeight / 2;
+  const minSide = Math.min(canvasWidth, canvasHeight);
+  const baseRadius = minSide * 0.35;
+  const scaledRadius = baseRadius * (spacing / 50);
+  const radius = Math.max(16, Math.min(minSide * 0.48, scaledRadius));
+
+  // Phyllotaxis layout gives stable, even circular point cloud density.
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+  const points: { x: number; y: number }[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const t = count === 1 ? 0 : i / (count - 1);
+    const r = radius * Math.sqrt(t);
+    const theta = i * goldenAngle;
+    points.push({
+      x: centerX + r * Math.cos(theta),
+      y: centerY + r * Math.sin(theta)
+    });
+  }
+  return points;
+}
+
+function clampGridCount(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+  return Math.max(1, Math.min(64, Math.round(value)));
+}
+
+function clonePoints(points: { x: number; y: number }[]): { x: number; y: number }[] {
+  return points.map((point) => ({ x: point.x, y: point.y }));
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isPoint(value: unknown): value is { x: number; y: number } {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as { x?: unknown; y?: unknown };
+  return isFiniteNumber(candidate.x) && isFiniteNumber(candidate.y);
+}
+
+function isPointArray(value: unknown): value is { x: number; y: number }[] {
+  return Array.isArray(value) && value.every((point) => isPoint(point));
+}
+
+function parseTrackPath(value: unknown): TrackPath | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const candidate = value as Partial<TrackPath> & {
+    pointMode?: unknown;
+    keyframes?: unknown;
+  };
+  if (
+    typeof candidate.id !== "string" ||
+    typeof candidate.name !== "string" ||
+    !isPointArray(candidate.points) ||
+    typeof candidate.closed !== "boolean" ||
+    typeof candidate.color !== "string"
+  ) {
+    return null;
+  }
+  const pointMode =
+    candidate.pointMode === "points" || candidate.pointMode === "polyline"
+      ? candidate.pointMode
+      : "points";
+  const keyframes = Array.isArray(candidate.keyframes)
+    ? candidate.keyframes.filter((frame): frame is { x: number; y: number }[] => isPointArray(frame))
+    : undefined;
+
+  return {
+    id: candidate.id,
+    name: candidate.name,
+    points: clonePoints(candidate.points),
+    keyframes,
+    pointMode,
+    closed: candidate.closed,
+    color: candidate.color
+  };
+}
+
+function parseTrackDocument(raw: unknown): TrackDocument | null {
+  if (typeof raw !== "object" || raw === null) {
+    return null;
+  }
+
+  const candidate = raw as {
+    version?: unknown;
+    image?: unknown;
+    grid?: unknown;
+    paths?: unknown;
+    meta?: unknown;
+  };
+  if (candidate.version !== "0.1") {
+    return null;
+  }
+  if (typeof candidate.image !== "object" || candidate.image === null) {
+    return null;
+  }
+  if (typeof candidate.grid !== "object" || candidate.grid === null) {
+    return null;
+  }
+
+  const image = candidate.image as { src?: unknown; width?: unknown; height?: unknown };
+  const grid = candidate.grid as {
+    type?: unknown;
+    spacing?: unknown;
+    offsetX?: unknown;
+    offsetY?: unknown;
+    visible?: unknown;
+  };
+  if (
+    typeof image.src !== "string" ||
+    !isFiniteNumber(image.width) ||
+    !isFiniteNumber(image.height) ||
+    grid.type !== "square" ||
+    !isFiniteNumber(grid.spacing) ||
+    !isFiniteNumber(grid.offsetX) ||
+    !isFiniteNumber(grid.offsetY) ||
+    typeof grid.visible !== "boolean" ||
+    !Array.isArray(candidate.paths)
+  ) {
+    return null;
+  }
+
+  const parsedPaths = candidate.paths
+    .map((path) => parseTrackPath(path))
+    .filter((path): path is TrackPath => path !== null);
+  if (parsedPaths.length !== candidate.paths.length) {
+    return null;
+  }
+
+  return {
+    version: "0.1",
+    image: {
+      src: image.src,
+      width: image.width,
+      height: image.height
+    },
+    grid: {
+      type: "square",
+      spacing: grid.spacing,
+      offsetX: grid.offsetX,
+      offsetY: grid.offsetY,
+      visible: grid.visible
+    },
+    paths: parsedPaths,
+    meta: {
+      createdAt: nowIso(),
+      updatedAt: nowIso()
+    }
+  };
+}
+
+function scalePointsAboutCentroid(
+  points: { x: number; y: number }[],
+  scale: number
+): { x: number; y: number }[] {
+  if (points.length === 0) {
+    return [];
+  }
+  const centerX =
+    points.reduce((sum, point) => sum + point.x, 0) / points.length;
+  const centerY =
+    points.reduce((sum, point) => sum + point.y, 0) / points.length;
+
+  return points.map((point) => ({
+    x: centerX + (point.x - centerX) * scale,
+    y: centerY + (point.y - centerY) * scale
+  }));
+}
+
+function ensureKeyframes(
+  path: TrackPath,
+  frameCount: number
+): { x: number; y: number }[][] {
+  const safeCount = Math.max(1, frameCount);
+  if (!path.keyframes || path.keyframes.length === 0) {
+    return Array.from({ length: safeCount }, () => clonePoints(path.points));
+  }
+
+  const resized = path.keyframes.slice(0, safeCount).map((frame) => clonePoints(frame));
+  const fallback = resized[resized.length - 1] ?? clonePoints(path.points);
+  while (resized.length < safeCount) {
+    resized.push(clonePoints(fallback));
+  }
+  return resized;
+}
+
+function makeNpyBuffer(
+  descr: "<f4" | "<i8",
+  shape: number[],
+  rawData: Uint8Array
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const shapeLiteral =
+    shape.length === 1 ? `(${shape[0]},)` : `(${shape.join(", ")},)`;
+  let header = `{'descr': '${descr}', 'fortran_order': False, 'shape': ${shapeLiteral}, }`;
+  const baseLength = 10;
+  const prePadLength = baseLength + header.length + 1;
+  const padLength = (16 - (prePadLength % 16)) % 16;
+  header = `${header}${" ".repeat(padLength)}\n`;
+  const headerBytes = encoder.encode(header);
+
+  const buffer = new Uint8Array(baseLength + headerBytes.length + rawData.length);
+  buffer[0] = 0x93;
+  buffer[1] = 0x4e;
+  buffer[2] = 0x55;
+  buffer[3] = 0x4d;
+  buffer[4] = 0x50;
+  buffer[5] = 0x59;
+  buffer[6] = 0x01;
+  buffer[7] = 0x00;
+  buffer[8] = headerBytes.length & 0xff;
+  buffer[9] = (headerBytes.length >> 8) & 0xff;
+  buffer.set(headerBytes, baseLength);
+  buffer.set(rawData, baseLength + headerBytes.length);
+  return buffer;
+}
+
+function typedArrayBytes(
+  values: Float32Array | BigInt64Array
+): Uint8Array {
+  return new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+}
+
+function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error("Failed to encode PNG blob"));
+        return;
+      }
+      resolve(blob);
+    }, "image/png");
+  });
+}
+
+function createDemoImageDataUrl(
+  width = DEFAULT_IMAGE_WIDTH,
+  height = DEFAULT_IMAGE_HEIGHT
+): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return "";
+  }
+
+  const grad = ctx.createLinearGradient(0, 0, width, height);
+  grad.addColorStop(0, "#202a3f");
+  grad.addColorStop(1, "#0f1522");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, width, height);
+
+  const block = 48;
+  for (let y = 0; y < height; y += block) {
+    for (let x = 0; x < width; x += block) {
+      const even = (x / block + y / block) % 2 === 0;
+      ctx.fillStyle = even ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.06)";
+      ctx.fillRect(x, y, block, block);
+    }
+  }
+
+  ctx.fillStyle = "rgba(210, 226, 255, 0.9)";
+  ctx.font = "600 28px Segoe UI";
+  ctx.textAlign = "center";
+  ctx.fillText("Track Builder Demo Canvas", width / 2, height / 2 - 10);
+  ctx.font = "15px Segoe UI";
+  ctx.fillStyle = "rgba(182, 204, 244, 0.95)";
+  ctx.fillText("Load Image to replace this demo background", width / 2, height / 2 + 20);
+
+  return canvas.toDataURL("image/png");
+}
+
+function dataUrlToBlob(dataUrl: string): Blob | null {
+  const parts = dataUrl.split(",");
+  if (parts.length !== 2) {
+    return null;
+  }
+
+  const mimeMatch = parts[0].match(/data:(.*?);base64/);
+  if (!mimeMatch) {
+    return null;
+  }
+  const mimeType = mimeMatch[1];
+  const byteString = atob(parts[1]);
+  const buffer = new Uint8Array(byteString.length);
+  for (let i = 0; i < byteString.length; i += 1) {
+    buffer[i] = byteString.charCodeAt(i);
+  }
+  return new Blob([buffer], { type: mimeType });
+}
+
+export default function App(): JSX.Element {
+  const [image, setImage] = useState<HTMLImageElement | null>(null);
+  const [imageSrc, setImageSrc] = useState<string>("");
+  const [activeObjectUrl, setActiveObjectUrl] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState<boolean>(false);
+  const [grid, setGrid] = useState<GridConfig>({
+    type: "square",
+    spacing: 50,
+    offsetX: 0,
+    offsetY: 0,
+    visible: false
+  });
+
+  const [paths, setPaths] = useState<TrackPath[]>([]);
+  const [selectedPathId, setSelectedPathId] = useState<string | null>(null);
+  const [gridRows, setGridRows] = useState<number>(8);
+  const [gridCols, setGridCols] = useState<number>(8);
+  const [pointCloudShape, setPointCloudShape] = useState<"square" | "circle">("square");
+  const [currentFrame, setCurrentFrame] = useState<number>(0);
+  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [isRecordingCompleted, setIsRecordingCompleted] = useState<boolean>(false);
+  const [pointSpacingScale, setPointSpacingScale] = useState<number>(1.0);
+  const [captionTask, setCaptionTask] = useState<string>(DEFAULT_FLORENCE_TASK);
+  const [generatedCaption, setGeneratedCaption] = useState<string>("");
+  const [isCaptioning, setIsCaptioning] = useState<boolean>(false);
+  const [status, setStatus] = useState<string>(
+    "Ready - Create point cloud and drag it across 81 frames"
+  );
+
+  useEffect(() => {
+    if (image) {
+      return;
+    }
+
+    const demoSrc = createDemoImageDataUrl();
+    if (!demoSrc) {
+      return;
+    }
+
+    const demoImage = new Image();
+    demoImage.onload = () => {
+      setImage(demoImage);
+      setImageSrc(demoSrc);
+      setStatus("Loaded demo canvas - Upload an image to start editing real input");
+    };
+    demoImage.src = demoSrc;
+  }, [image]);
+
+  const displayPaths = useMemo(
+    () =>
+      paths.map((path) => ({
+        ...path,
+        points:
+          path.keyframes?.[currentFrame] !== undefined
+            ? path.keyframes[currentFrame]
+            : path.points
+      })),
+    [currentFrame, paths]
+  );
+
+  const selectedPath = useMemo(
+    () => paths.find((path) => path.id === selectedPathId) ?? null,
+    [paths, selectedPathId]
+  );
+
+  const selectedDisplayPath = useMemo(
+    () => displayPaths.find((path) => path.id === selectedPathId) ?? null,
+    [displayPaths, selectedPathId]
+  );
+
+  const targetPointCount = useMemo(
+    () => clampGridCount(gridRows) * clampGridCount(gridCols),
+    [gridCols, gridRows]
+  );
+
+  useEffect(() => {
+    if (currentFrame > FRAME_COUNT - 1) {
+      setCurrentFrame(FRAME_COUNT - 1);
+    }
+  }, [currentFrame]);
+
+  const loadImageFile = async (file: File): Promise<void> => {
+    if (!file.type.startsWith("image/")) {
+      setStatus(`Skipped non-image file: ${file.name}`);
+      return;
+    }
+
+    const tempObjectUrl = URL.createObjectURL(file);
+    try {
+      const original = await loadHtmlImage(tempObjectUrl);
+      const canvas = document.createElement("canvas");
+      canvas.width = DEFAULT_IMAGE_WIDTH;
+      canvas.height = DEFAULT_IMAGE_HEIGHT;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        setStatus("Failed to process image");
+        return;
+      }
+
+      drawCenterCropCover(
+        ctx,
+        original,
+        DEFAULT_IMAGE_WIDTH,
+        DEFAULT_IMAGE_HEIGHT
+      );
+      const processedSrc = canvas.toDataURL("image/png");
+      const processedImage = await loadHtmlImage(processedSrc);
+
+      if (activeObjectUrl) {
+        URL.revokeObjectURL(activeObjectUrl);
+        setActiveObjectUrl(null);
+      }
+      setImage(processedImage);
+      setImageSrc(processedSrc);
+      setGeneratedCaption("");
+      setStatus(
+        `Loaded and resized to ${DEFAULT_IMAGE_WIDTH}x${DEFAULT_IMAGE_HEIGHT} (source ${original.width}x${original.height})`
+      );
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? `Failed to load image: ${error.message}`
+          : "Failed to load image"
+      );
+    } finally {
+      URL.revokeObjectURL(tempObjectUrl);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (activeObjectUrl) {
+        URL.revokeObjectURL(activeObjectUrl);
+      }
+    };
+  }, [activeObjectUrl]);
+
+  const onImageUpload = async (event: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    await loadImageFile(file);
+  };
+
+  const onCanvasDragOver = (event: React.DragEvent<HTMLElement>): void => {
+    event.preventDefault();
+    if (!isDragOver) {
+      setIsDragOver(true);
+    }
+  };
+
+  const onCanvasDragLeave = (event: React.DragEvent<HTMLElement>): void => {
+    event.preventDefault();
+    const nextTarget = event.relatedTarget as Node | null;
+    if (nextTarget && event.currentTarget.contains(nextTarget)) {
+      return;
+    }
+    setIsDragOver(false);
+  };
+
+  const onCanvasDrop = async (event: React.DragEvent<HTMLElement>): Promise<void> => {
+    event.preventDefault();
+    setIsDragOver(false);
+    const file = event.dataTransfer.files?.[0];
+    if (!file) {
+      return;
+    }
+    await loadImageFile(file);
+  };
+
+  const deleteSelectedPath = (): void => {
+    if (!selectedPathId) {
+      return;
+    }
+
+    setPaths((prev) => prev.filter((path) => path.id !== selectedPathId));
+    setSelectedPathId(null);
+    setIsRecordingCompleted(false);
+    setStatus("Deleted selected path");
+  };
+
+  const createOrUpdatePointCloudPath = (): void => {
+    const rows = clampGridCount(gridRows);
+    const cols = clampGridCount(gridCols);
+    const spacing = Math.max(4, Math.round(grid.spacing));
+    const width = image?.width ?? 960;
+    const height = image?.height ?? 540;
+    const points =
+      pointCloudShape === "circle"
+        ? createCirclePoints(rows * cols, spacing, width, height)
+        : createSquareGridPoints(rows, cols, spacing, width, height);
+    const shapeLabel = pointCloudShape === "circle" ? "circle" : "square";
+
+    if (selectedPathId) {
+      setPaths((prev) =>
+        prev.map((path) =>
+          path.id === selectedPathId
+            ? {
+                ...path,
+                points,
+                keyframes: Array.from({ length: FRAME_COUNT }, () =>
+                  clonePoints(points)
+                ),
+                pointMode: "points"
+              }
+            : path
+        )
+      );
+      setStatus(
+        `Updated selected path as ${shapeLabel} point cloud (${points.length} points)`
+      );
+      setIsRecordingCompleted(false);
+      return;
+    }
+
+    const newPath: TrackPath = {
+      id: generatePathId(),
+      name:
+        pointCloudShape === "circle"
+          ? `Circle ${rows * cols}pts`
+          : `Grid ${rows}x${cols}`,
+      points,
+      keyframes: Array.from({ length: FRAME_COUNT }, () =>
+        clonePoints(points)
+      ),
+      pointMode: "points",
+      closed: false,
+      color: "#00d7ff"
+    };
+    setPaths((prev) => [...prev, newPath]);
+    setSelectedPathId(newPath.id);
+    setIsRecordingCompleted(false);
+    setStatus(`Created ${shapeLabel} point cloud (${points.length} points)`);
+  };
+
+  const handlePointSpacingScaleChange = (nextScale: number): void => {
+    const clamped = Math.max(0.2, Math.min(3.0, nextScale));
+    if (!selectedPathId) {
+      setPointSpacingScale(clamped);
+      return;
+    }
+
+    const prevScale = Math.max(0.2, Math.min(3.0, pointSpacingScale));
+    const ratio = clamped / prevScale;
+    if (!Number.isFinite(ratio) || ratio <= 0) {
+      setPointSpacingScale(clamped);
+      return;
+    }
+
+    setPaths((prev) =>
+      prev.map((path) => {
+        if (path.id !== selectedPathId) {
+          return path;
+        }
+        const keyframes = ensureKeyframes(path, FRAME_COUNT).map((frame) =>
+          scalePointsAboutCentroid(frame, ratio)
+        );
+        return {
+          ...path,
+          keyframes,
+          points: keyframes[currentFrame] ?? path.points
+        };
+      })
+    );
+    setPointSpacingScale(clamped);
+  };
+
+  useEffect(() => {
+    setPaths((prev) =>
+      prev.map((path) => ({
+        ...path,
+        keyframes: ensureKeyframes(path, FRAME_COUNT)
+      }))
+    );
+  }, []);
+
+  const setCurrentAsStart = (): void => {
+    if (!selectedPathId) {
+      setStatus("Select a point cloud first");
+      return;
+    }
+    setPaths((prevPaths) =>
+      prevPaths.map((path) => {
+        if (path.id !== selectedPathId) {
+          return path;
+        }
+        const keyframes = ensureKeyframes(path, FRAME_COUNT);
+        const source = clonePoints(keyframes[currentFrame] ?? keyframes[0] ?? []);
+        keyframes[0] = source;
+        return {
+          ...path,
+          points: source,
+          keyframes
+        };
+      })
+    );
+    setCurrentFrame(0);
+    setIsRecordingCompleted(false);
+    setStatus("Set current point cloud pose as start frame (frame 1)");
+  };
+
+  const handlePathDrag = (pathId: string, dx: number, dy: number): void => {
+    if (dx === 0 && dy === 0) {
+      return;
+    }
+
+    setPaths((prevPaths) =>
+      prevPaths.map((path) => {
+        if (path.id !== pathId) {
+          return path;
+        }
+        const keyframes = ensureKeyframes(path, FRAME_COUNT);
+        const sourcePoints = keyframes[currentFrame] ?? keyframes[0] ?? [];
+        const movedPoints = sourcePoints.map((point) => ({
+          x: point.x + dx,
+          y: point.y + dy
+        }));
+        keyframes[currentFrame] = movedPoints;
+        return {
+          ...path,
+          points: movedPoints,
+          keyframes
+        };
+      })
+    );
+  };
+
+  const handleRecordTick = (pathId: string): void => {
+    if (!isRecording) {
+      return;
+    }
+
+    setCurrentFrame((prevFrame) => {
+      const nextFrame = prevFrame < FRAME_COUNT - 1 ? prevFrame + 1 : prevFrame;
+
+      setPaths((prevPaths) =>
+        prevPaths.map((path) => {
+          if (path.id !== pathId) {
+            return path;
+          }
+
+          const keyframes = ensureKeyframes(path, FRAME_COUNT);
+          const sourcePoints = keyframes[prevFrame] ?? keyframes[0] ?? [];
+          keyframes[nextFrame] = clonePoints(sourcePoints);
+
+          return {
+            ...path,
+            points: keyframes[nextFrame] ?? sourcePoints,
+            keyframes
+          };
+        })
+      );
+
+      if (nextFrame >= FRAME_COUNT - 1) {
+        setIsRecording(false);
+        setIsRecordingCompleted(true);
+        setStatus("Reached final frame. Recording turned OFF automatically.");
+      }
+
+      return nextFrame;
+    });
+  };
+
+  const exportJson = (): void => {
+    const width = image?.width ?? 960;
+    const height = image?.height ?? 540;
+
+    const doc: TrackDocument = {
+      version: "0.1",
+      image: {
+        src: imageSrc,
+        width,
+        height
+      },
+      grid,
+      paths,
+      meta: {
+        createdAt: nowIso(),
+        updatedAt: nowIso()
+      }
+    };
+
+    const blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "track_document.json";
+    link.click();
+    URL.revokeObjectURL(url);
+    setStatus("Exported track_document.json");
+  };
+
+  const exportTrackPackage = async (): Promise<void> => {
+    const targetPath = selectedPath ?? paths[0] ?? null;
+    if (!targetPath) {
+      setStatus("No path available to export");
+      return;
+    }
+    if (!image) {
+      setStatus("No image available to export");
+      return;
+    }
+
+    try {
+      const keyframes = ensureKeyframes(targetPath, FRAME_COUNT);
+      const pointCount = keyframes[0]?.length ?? 0;
+      if (pointCount <= 0) {
+        setStatus("Selected path has no points");
+        return;
+      }
+
+      const tracks = new Float32Array(FRAME_COUNT * pointCount * 2);
+      const visibility = new Float32Array(FRAME_COUNT * pointCount);
+      for (let frame = 0; frame < FRAME_COUNT; frame += 1) {
+        const framePoints = keyframes[frame] ?? [];
+        for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
+          const point = framePoints[pointIndex];
+          const baseTrackIdx = (frame * pointCount + pointIndex) * 2;
+          if (point) {
+            tracks[baseTrackIdx] = point.x;
+            tracks[baseTrackIdx + 1] = point.y;
+            visibility[frame * pointCount + pointIndex] = 1;
+          } else {
+            tracks[baseTrackIdx] = 0;
+            tracks[baseTrackIdx + 1] = 0;
+            visibility[frame * pointCount + pointIndex] = 0;
+          }
+        }
+      }
+
+      const validIdx = new BigInt64Array(pointCount);
+      for (let i = 0; i < pointCount; i += 1) {
+        validIdx[i] = BigInt(i);
+      }
+
+      const trackNpzZip = new JSZip();
+      trackNpzZip.file(
+        "tracks_compressed.npy",
+        makeNpyBuffer(
+          "<f4",
+          [FRAME_COUNT, pointCount, 2],
+          typedArrayBytes(tracks)
+        )
+      );
+      trackNpzZip.file(
+        "visibility_compressed.npy",
+        makeNpyBuffer(
+          "<f4",
+          [FRAME_COUNT, pointCount],
+          typedArrayBytes(visibility)
+        )
+      );
+      trackNpzZip.file(
+        "valid_idx.npy",
+        makeNpyBuffer(
+          "<i8",
+          [pointCount],
+          typedArrayBytes(validIdx)
+        )
+      );
+      const trackNpzBlob = await trackNpzZip.generateAsync({
+        type: "blob",
+        compression: "DEFLATE"
+      });
+
+      const firstFrameCanvas = document.createElement("canvas");
+      firstFrameCanvas.width = DEFAULT_IMAGE_WIDTH;
+      firstFrameCanvas.height = DEFAULT_IMAGE_HEIGHT;
+      const firstFrameCtx = firstFrameCanvas.getContext("2d");
+      if (!firstFrameCtx) {
+        setStatus("Failed to export first frame image");
+        return;
+      }
+      drawCenterCropCover(
+        firstFrameCtx,
+        image,
+        DEFAULT_IMAGE_WIDTH,
+        DEFAULT_IMAGE_HEIGHT
+      );
+      const firstFrameBlob = await canvasToPngBlob(firstFrameCanvas);
+
+      const packageZip = new JSZip();
+      const exportDir = "processed_832x480_fps16";
+      packageZip.file(`${exportDir}/first_frame.png`, firstFrameBlob);
+      packageZip.file(
+        `${exportDir}/transformed_tracks_grid50_survived.npz`,
+        trackNpzBlob
+      );
+      const captionFileContent = [
+        `task_prompt: ${captionTask.trim() || DEFAULT_FLORENCE_TASK}`,
+        `generated_at: ${new Date().toISOString()}`,
+        "",
+        generatedCaption.trim() || "(empty caption)"
+      ].join("\n");
+      packageZip.file(`${exportDir}/image_caption.txt`, captionFileContent);
+      const packageBlob = await packageZip.generateAsync({
+        type: "blob",
+        compression: "DEFLATE"
+      });
+
+      const url = URL.createObjectURL(packageBlob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "processed_832x480_fps16.zip";
+      link.click();
+      URL.revokeObjectURL(url);
+      setStatus(
+        `Exported track package (+ image_caption.txt): ${FRAME_COUNT} frames, ${pointCount} points`
+      );
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? `Failed to export track package: ${error.message}`
+          : "Failed to export track package"
+      );
+    }
+  };
+
+  const importJson = async (event: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    try {
+      const parsedJson = JSON.parse(await file.text()) as unknown;
+      const parsed = parseTrackDocument(parsedJson);
+      if (!parsed) {
+        setStatus("Invalid JSON schema. Import aborted.");
+        return;
+      }
+
+      setGrid({ ...parsed.grid, visible: false });
+      setPaths(
+        parsed.paths.map((path) => ({
+          ...path,
+          pointMode: "points",
+          keyframes: ensureKeyframes(path, FRAME_COUNT)
+        }))
+      );
+      setSelectedPathId(parsed.paths[0]?.id ?? null);
+      setCurrentFrame(0);
+      setIsRecordingCompleted(false);
+
+      if (activeObjectUrl) {
+        URL.revokeObjectURL(activeObjectUrl);
+        setActiveObjectUrl(null);
+      }
+      if (parsed.image?.src) {
+        const img = new Image();
+        img.onload = () => setImage(img);
+        img.src = parsed.image.src;
+        setImageSrc(parsed.image.src);
+        setGeneratedCaption("");
+      }
+
+      setStatus("Imported track document");
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? `Failed to import JSON: ${error.message}`
+          : "Failed to import JSON"
+      );
+    }
+  };
+
+  const generateImageCaption = async (): Promise<void> => {
+    if (!imageSrc) {
+      setStatus("Load image first");
+      return;
+    }
+    const imageBlob = dataUrlToBlob(imageSrc);
+    if (!imageBlob) {
+      setStatus("Unsupported image source for captioning");
+      return;
+    }
+
+    setIsCaptioning(true);
+    setStatus("Generating Florence caption...");
+    try {
+      const formData = new FormData();
+      formData.append("file", imageBlob, "track_builder_input.png");
+      formData.append("task", captionTask.trim() || DEFAULT_FLORENCE_TASK);
+
+      const response = await fetch(buildApiUrl("/api/images/caption"), {
+        method: "POST",
+        body: formData
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as {
+        text?: string;
+        task?: string;
+      };
+      const nextCaption = payload.text?.trim() ?? "";
+      if (!nextCaption) {
+        setGeneratedCaption("");
+        setStatus("Caption response is empty");
+        return;
+      }
+      setGeneratedCaption(nextCaption);
+      setStatus(`Caption generated with task ${payload.task ?? captionTask}`);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unknown error";
+      setStatus(
+        `Caption failed: ${reason} (check backend on :8000 or set VITE_BACKEND_URL)`
+      );
+    } finally {
+      setIsCaptioning(false);
+    }
+  };
+
+  return (
+    <div className="app-root">
+      <main
+        className={isDragOver ? "main-drop active" : "main-drop"}
+        onDragOver={onCanvasDragOver}
+        onDragEnter={onCanvasDragOver}
+        onDragLeave={onCanvasDragLeave}
+        onDrop={onCanvasDrop}
+      >
+        {isDragOver ? (
+          <div className="drop-overlay">Drop image here</div>
+        ) : null}
+
+        <div className="app-layout">
+          <aside className="control-panel">
+            <div className="panel-title">Track Builder Controls</div>
+            <div className="status">
+              {isRecording
+                ? `Recording... ${currentFrame + 1}/${FRAME_COUNT}`
+                : isRecordingCompleted
+                  ? "Recording complete"
+                  : status}
+            </div>
+
+            <section className="control-section">
+              <h3>1) Input</h3>
+              <div className="control-row">
+                <label className="btn">
+                  Load Image
+                  <input type="file" accept="image/*" onChange={onImageUpload} hidden />
+                </label>
+                <label className="btn">
+                  Import JSON
+                  <input type="file" accept="application/json" onChange={importJson} hidden />
+                </label>
+                <button type="button" onClick={exportJson}>Export JSON</button>
+                <button type="button" onClick={() => void exportTrackPackage()}>
+                  Export Track Package
+                </button>
+              </div>
+              <div className="path-info">
+                Image: {image ? `${image.width}x${image.height}` : "None"}
+              </div>
+              <label className="slider-field">
+                Florence Task Prompt
+                <input
+                  type="text"
+                  value={captionTask}
+                  onChange={(event) => setCaptionTask(event.target.value)}
+                  placeholder="<MORE_DETAILED_CAPTION>"
+                  disabled={isCaptioning}
+                />
+              </label>
+              <div className="control-row">
+                <button
+                  type="button"
+                  onClick={() => void generateImageCaption()}
+                  disabled={isCaptioning || !image}
+                >
+                  {isCaptioning ? "Generating Caption..." : "Generate Caption (Florence)"}
+                </button>
+              </div>
+              <label className="slider-field">
+                Image Caption
+                <textarea
+                  value={generatedCaption}
+                  onChange={(event) => setGeneratedCaption(event.target.value)}
+                  placeholder="Caption will appear here"
+                  rows={4}
+                />
+              </label>
+            </section>
+
+            <section className="control-section">
+              <h3>2) Point Cloud</h3>
+              <div className="control-row">
+                <label>
+                  Shape
+                  <select
+                    value={pointCloudShape}
+                    onChange={(event) =>
+                      setPointCloudShape(
+                        event.target.value === "circle" ? "circle" : "square"
+                      )
+                    }
+                    disabled={isRecording}
+                  >
+                    <option value="square">Square</option>
+                    <option value="circle">Circle</option>
+                  </select>
+                </label>
+                <label>
+                  Rows
+                  <input
+                    className="numeric-input"
+                    type="number"
+                    min={1}
+                    max={64}
+                    value={gridRows}
+                    onChange={(event) => setGridRows(clampGridCount(Number(event.target.value)))}
+                  />
+                </label>
+                <label>
+                  Cols
+                  <input
+                    className="numeric-input"
+                    type="number"
+                    min={1}
+                    max={64}
+                    value={gridCols}
+                    onChange={(event) => setGridCols(clampGridCount(Number(event.target.value)))}
+                  />
+                </label>
+              </div>
+              <div className="path-info">Target: {targetPointCount} points</div>
+              <div className="control-row">
+                <button type="button" onClick={createOrUpdatePointCloudPath} disabled={isRecording}>
+                  Create / Update Point Cloud
+                </button>
+                <button
+                  type="button"
+                  onClick={setCurrentAsStart}
+                  disabled={!selectedPathId || isRecording}
+                >
+                  Use Current Pose as Frame 1
+                </button>
+              </div>
+              <label className="slider-field">
+                Point Spacing Scale: x{pointSpacingScale.toFixed(2)}
+                <input
+                  type="range"
+                  min={0.2}
+                  max={3}
+                  step={0.05}
+                  value={pointSpacingScale}
+                  onChange={(event) =>
+                    handlePointSpacingScaleChange(Number(event.target.value))
+                  }
+                  disabled={!selectedPathId || isRecording}
+                />
+              </label>
+            </section>
+
+            <section className="control-section">
+              <h3>3) Recording</h3>
+              <button
+                type="button"
+                className={isRecording ? "recording-button recording primary" : "recording-button primary"}
+                onClick={() =>
+                  setIsRecording((prev) => {
+                    const next = !prev;
+                    if (next) {
+                      setIsRecordingCompleted(false);
+                    }
+                    return next;
+                  })
+                }
+                disabled={!selectedPathId}
+              >
+                {isRecording ? "Recording" : "Recording ON"}
+              </button>
+              <label className="slider-field">
+                Time: {currentFrame + 1}/{FRAME_COUNT}
+                <input
+                  type="range"
+                  min={0}
+                  max={FRAME_COUNT - 1}
+                  value={Math.min(currentFrame, FRAME_COUNT - 1)}
+                  onChange={(event) => setCurrentFrame(Number(event.target.value))}
+                />
+              </label>
+              <div className="control-row">
+                <button type="button" onClick={() => setCurrentFrame(0)}>Reset to Frame 1</button>
+              </div>
+            </section>
+
+            <section className="control-section danger">
+              <h3>4) Cleanup</h3>
+              <button type="button" onClick={deleteSelectedPath} disabled={!selectedPathId}>
+                Delete Selected Path
+              </button>
+            </section>
+
+            <div className="path-info">
+              Selected: {selectedPath ? selectedPath.name : "None"} (
+              {selectedDisplayPath?.points.length ?? 0} pts @ frame {currentFrame + 1})
+            </div>
+          </aside>
+
+          <div className="canvas-stage">
+            <TrackCanvas
+              image={image}
+              grid={{ ...grid, visible: false }}
+              paths={displayPaths}
+              selectedPathId={selectedPathId}
+              onMovePathPoints={handlePathDrag}
+              onRecordTick={handleRecordTick}
+              onSelectPath={setSelectedPathId}
+              onDragComplete={() => undefined}
+            />
+          </div>
+
+          <aside className="preview-stage">
+            <TrackPreview
+              image={image}
+              path={selectedPath}
+              frameCount={FRAME_COUNT}
+              currentFrame={currentFrame}
+            />
+          </aside>
+        </div>
+      </main>
+    </div>
+  );
+}

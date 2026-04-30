@@ -16,6 +16,7 @@ export type TrackPath = {
   name: string;
   points: Point[];
   keyframes?: Point[][];
+  trackMode?: "moving" | "static";
   pointMode?: "polyline" | "points";
   closed: boolean;
   color: string;

@@ -431,12 +431,6 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
-        if prompt is not None and negative_prompt_embeds is not None:
-            raise ValueError(
-                f"Cannot forward both `prompt`: {prompt} and `negative_prompt_embeds`:"
-                f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
-            )
-
         if negative_prompt is not None and negative_prompt_embeds is not None:
             raise ValueError(
                 f"Cannot forward both `negative_prompt`: {negative_prompt} and `negative_prompt_embeds`:"
@@ -444,12 +438,57 @@ class WanFunInpaintPipeline(DiffusionPipeline):
             )
 
         if prompt_embeds is not None and negative_prompt_embeds is not None:
-            if prompt_embeds.shape != negative_prompt_embeds.shape:
+            if isinstance(prompt_embeds, torch.Tensor) and isinstance(negative_prompt_embeds, torch.Tensor):
+                same_shape = prompt_embeds.shape == negative_prompt_embeds.shape
+                prompt_desc = tuple(prompt_embeds.shape)
+                negative_desc = tuple(negative_prompt_embeds.shape)
+            else:
+                same_shape = len(prompt_embeds) == len(negative_prompt_embeds)
+                prompt_desc = f"len={len(prompt_embeds)}"
+                negative_desc = f"len={len(negative_prompt_embeds)}"
+            if not same_shape:
                 raise ValueError(
                     "`prompt_embeds` and `negative_prompt_embeds` must have the same shape when passed directly, but"
-                    f" got: `prompt_embeds` {prompt_embeds.shape} != `negative_prompt_embeds`"
-                    f" {negative_prompt_embeds.shape}."
+                    f" got: `prompt_embeds` {prompt_desc} != `negative_prompt_embeds`"
+                    f" {negative_desc}."
                 )
+
+    @staticmethod
+    def _prompt_batch_size(prompt_embeds):
+        if isinstance(prompt_embeds, torch.Tensor):
+            return prompt_embeds.shape[0]
+        return len(prompt_embeds)
+
+    @staticmethod
+    def _normalize_prompt_batch(prompt_embeds):
+        if prompt_embeds is None:
+            return None
+        if isinstance(prompt_embeds, torch.Tensor):
+            if prompt_embeds.ndim == 2:
+                prompt_embeds = prompt_embeds.unsqueeze(0)
+            if prompt_embeds.ndim != 3:
+                raise ValueError(
+                    "prompt_embeds tensor must be [L,D] or [B,L,D], "
+                    f"got {tuple(prompt_embeds.shape)}"
+                )
+            return [u for u in prompt_embeds]
+        if isinstance(prompt_embeds, tuple):
+            prompt_embeds = list(prompt_embeds)
+        if isinstance(prompt_embeds, list):
+            return prompt_embeds
+        raise TypeError(
+            "`prompt_embeds` must be a Tensor, list, or tuple of per-sample embeddings, "
+            f"got {type(prompt_embeds)}"
+        )
+
+    @staticmethod
+    def _concat_prompt_batches(*batches):
+        merged = []
+        for batch in batches:
+            if batch is None:
+                continue
+            merged.extend(batch)
+        return merged
 
     @property
     def guidance_scale(self):
@@ -480,7 +519,10 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         num_frames: int = 49,
         num_inference_steps: int = 50,
         timesteps: Optional[List[int]] = None,
+        guidance_mode: str = "cfg",
         guidance_scale: float = 6,
+        text_guidance_weight: float = 3.0,
+        motion_guidance_weight: float = 1.5,
         num_videos_per_prompt: int = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -530,13 +572,30 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         self._attention_kwargs = attention_kwargs
         self._interrupt = False
 
+        guidance_mode = str(guidance_mode).strip().lower()
+        if guidance_mode not in ("cfg", "joint_tm", "text_only", "motion_only", "unified"):
+            raise ValueError(
+                f"Unsupported guidance_mode={guidance_mode!r}. "
+                "Use one of ['cfg', 'joint_tm', 'text_only', 'motion_only', 'unified']."
+            )
+        do_joint_guidance = guidance_mode == "joint_tm"
+        do_text_only_guidance = guidance_mode == "text_only"
+        do_motion_only_guidance = guidance_mode == "motion_only"
+        do_unified_guidance = guidance_mode == "unified"
+        do_custom_dual_guidance = do_text_only_guidance or do_motion_only_guidance or do_unified_guidance
+        if do_joint_guidance and (text_guidance_weight + motion_guidance_weight) == 0:
+            raise ValueError(
+                "text_guidance_weight + motion_guidance_weight must be non-zero "
+                "for guidance_mode='joint_tm'."
+            )
+
         # 2. Default call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
         else:
-            batch_size = prompt_embeds.shape[0]
+            batch_size = self._prompt_batch_size(prompt_embeds)
 
         device = self._execution_device
         weight_dtype = self.text_encoder.dtype
@@ -544,21 +603,46 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = guidance_scale > 1.0
+        do_classifier_free_guidance = guidance_scale > 1.0 and guidance_mode == "cfg"
 
         # 3. Encode input prompt
         prompt_embeds, negative_prompt_embeds = self.encode_prompt( # [[token_length, 4096],... ], [[token_length, 4096],... ]
             prompt,
             negative_prompt,
-            do_classifier_free_guidance,
+            do_classifier_free_guidance or do_joint_guidance or do_custom_dual_guidance,
             num_videos_per_prompt=num_videos_per_prompt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             max_sequence_length=max_sequence_length,
             device=device,
         )
-        if do_classifier_free_guidance:
-            in_prompt_embeds = negative_prompt_embeds + prompt_embeds
+        prompt_embeds = self._normalize_prompt_batch(prompt_embeds)
+        negative_prompt_embeds = self._normalize_prompt_batch(negative_prompt_embeds)
+        if do_joint_guidance:
+            # Three text branches for joint guidance:
+            # 1) text+motion, 2) null_text+motion, 3) text+null_motion.
+            in_prompt_embeds = self._concat_prompt_batches(
+                prompt_embeds,
+                negative_prompt_embeds,
+                prompt_embeds,
+            )
+        elif do_unified_guidance:
+            # Branch order: [v(c_t,c_m), v(c_null,c_m_null)].
+            in_prompt_embeds = self._concat_prompt_batches(prompt_embeds, negative_prompt_embeds)
+        elif do_text_only_guidance:
+            # Branch order: [v(c_t,c_m_null), v(c_null,c_m_null)].
+            in_prompt_embeds = self._concat_prompt_batches(prompt_embeds, negative_prompt_embeds)
+        elif do_motion_only_guidance:
+            # Branch order: [v(c_null,c_m), v(c_null,c_m_null)].
+            in_prompt_embeds = self._concat_prompt_batches(
+                negative_prompt_embeds,
+                negative_prompt_embeds,
+            )
+        elif do_classifier_free_guidance:
+            in_prompt_embeds = self._concat_prompt_batches(
+                negative_prompt_embeds,
+                prompt_embeds,
+            )
         else:
             in_prompt_embeds = prompt_embeds
 
@@ -668,10 +752,13 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         self.transformer.num_inference_steps = num_inference_steps
 
         track_condition_base = None
+        if os.environ.get("PDB_DEBUG", "0") == "1":
+            import pdb; pdb.set_trace()
         if track_condition is not None:
             tracks = track_condition.get("tracks", None)
             visibility = track_condition.get("visibility", None)
             point_mask = track_condition.get("point_mask", None)
+            is_normalized = track_condition.get("is_normalized", None)
             if tracks is not None and visibility is not None:
                 tracks = tracks.to(device=device, dtype=torch.float32)
                 visibility = visibility.to(device=device, dtype=torch.float32)
@@ -703,12 +790,35 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                             f"does not match expected batch={expected_batch}."
                         )
 
+                if is_normalized is not None:
+                    if isinstance(is_normalized, torch.Tensor):
+                        is_normalized = is_normalized.to(device=device)
+                    else:
+                        is_normalized = torch.as_tensor(is_normalized, device=device)
+                    if is_normalized.ndim == 0:
+                        is_normalized = is_normalized.view(1)
+                    if is_normalized.ndim != 1:
+                        raise ValueError(
+                            "track_condition.is_normalized must be scalar or [B], "
+                            f"got {tuple(is_normalized.shape)}"
+                        )
+                    if is_normalized.shape[0] == 1 and expected_batch > 1:
+                        is_normalized = is_normalized.expand(expected_batch).contiguous()
+                    elif is_normalized.shape[0] != expected_batch:
+                        raise ValueError(
+                            f"track_condition.is_normalized batch={is_normalized.shape[0]} "
+                            f"does not match expected batch={expected_batch}."
+                        )
+                    is_normalized = is_normalized.to(dtype=torch.bool)
+
                 track_condition_base = {
                     "tracks": tracks,
                     "visibility": visibility,
                 }
                 if point_mask is not None:
                     track_condition_base["point_mask"] = point_mask
+                if is_normalized is not None:
+                    track_condition_base["is_normalized"] = is_normalized
 
                 track_res = track_condition.get("track_resolution", None)
                 if track_res is not None:
@@ -729,6 +839,22 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                         )
                     track_condition_base["track_resolution"] = track_res
 
+        if do_joint_guidance and track_condition_base is None:
+            raise ValueError(
+                "guidance_mode='joint_tm' requires non-empty `track_condition` "
+                "because motion-conditioned branches are mandatory."
+            )
+        if do_unified_guidance and track_condition_base is None:
+            raise ValueError(
+                "guidance_mode='unified' requires non-empty `track_condition` "
+                "because the conditional branch must be motion-conditioned."
+            )
+        if do_motion_only_guidance and track_condition_base is None:
+            raise ValueError(
+                "guidance_mode='motion_only' requires non-empty `track_condition` "
+                "because the motion branch must be conditioned."
+            )
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 self.transformer.current_steps = i
@@ -736,23 +862,171 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                 if self.interrupt:
                     continue
 
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                if do_joint_guidance:
+                    latent_model_input = torch.cat([latents] * 3)
+                elif do_custom_dual_guidance or do_classifier_free_guidance:
+                    latent_model_input = torch.cat([latents] * 2)
+                else:
+                    latent_model_input = latents
                 if hasattr(self.scheduler, "scale_model_input"):
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 if init_video is not None:
-                    mask_input = torch.cat([mask_latents] * 2) if do_classifier_free_guidance else mask_latents
-                    masked_video_latents_input = (
-                        torch.cat([masked_video_latents] * 2) if do_classifier_free_guidance else masked_video_latents
-                    )
+                    if do_joint_guidance:
+                        mask_input = torch.cat([mask_latents] * 3)
+                        masked_video_latents_input = torch.cat([masked_video_latents] * 3)
+                    elif do_custom_dual_guidance or do_classifier_free_guidance:
+                        mask_input = torch.cat([mask_latents] * 2)
+                        masked_video_latents_input = torch.cat([masked_video_latents] * 2)
+                    else:
+                        mask_input = mask_latents
+                        masked_video_latents_input = masked_video_latents
                     y = torch.cat([mask_input, masked_video_latents_input], dim=1).to(device, weight_dtype) 
 
-                clip_context_input = ( # [2, 257, 1280]
-                    torch.cat([clip_context] * 2) if do_classifier_free_guidance else clip_context
+                clip_context_input = (
+                    torch.cat([clip_context] * 3)
+                    if do_joint_guidance
+                    else torch.cat([clip_context] * 2)
+                    if (do_custom_dual_guidance or do_classifier_free_guidance)
+                    else clip_context
                 )
                 track_condition_input = None
                 if track_condition_base is not None:
-                    if do_classifier_free_guidance:
+                    if do_joint_guidance:
+                        # Branch order: [v(c_t,c_m), v(c_null,c_m), v(c_t,c_m_null)].
+                        track_condition_input = {
+                            "tracks": torch.cat(
+                                [
+                                    track_condition_base["tracks"],
+                                    track_condition_base["tracks"],
+                                    torch.zeros_like(track_condition_base["tracks"]),
+                                ],
+                                dim=0,
+                            ),
+                            "visibility": torch.cat(
+                                [
+                                    track_condition_base["visibility"],
+                                    track_condition_base["visibility"],
+                                    torch.zeros_like(track_condition_base["visibility"]),
+                                ],
+                                dim=0,
+                            ),
+                        }
+                        if "point_mask" in track_condition_base:
+                            track_condition_input["point_mask"] = torch.cat(
+                                [
+                                    track_condition_base["point_mask"],
+                                    track_condition_base["point_mask"],
+                                    torch.zeros_like(track_condition_base["point_mask"]),
+                                ],
+                                dim=0,
+                            )
+                        if "is_normalized" in track_condition_base:
+                            inorm = track_condition_base["is_normalized"]
+                            track_condition_input["is_normalized"] = torch.cat(
+                                [inorm, inorm, inorm], dim=0
+                            )
+                        if "track_resolution" in track_condition_base:
+                            tr = track_condition_base["track_resolution"]
+                            track_condition_input["track_resolution"] = torch.cat([tr, tr, tr], dim=0)
+                    elif do_unified_guidance:
+                        # Wan-Move style CFG: [v(c_t,c_m), v(c_null,c_m_null)].
+                        track_condition_input = {
+                            "tracks": torch.cat(
+                                [
+                                    track_condition_base["tracks"],
+                                    torch.zeros_like(track_condition_base["tracks"]),
+                                ],
+                                dim=0,
+                            ),
+                            "visibility": torch.cat(
+                                [
+                                    track_condition_base["visibility"],
+                                    torch.zeros_like(track_condition_base["visibility"]),
+                                ],
+                                dim=0,
+                            ),
+                        }
+                        if "point_mask" in track_condition_base:
+                            track_condition_input["point_mask"] = torch.cat(
+                                [
+                                    track_condition_base["point_mask"],
+                                    torch.zeros_like(track_condition_base["point_mask"]),
+                                ],
+                                dim=0,
+                            )
+                        if "is_normalized" in track_condition_base:
+                            inorm = track_condition_base["is_normalized"]
+                            track_condition_input["is_normalized"] = torch.cat(
+                                [inorm, inorm], dim=0
+                            )
+                        if "track_resolution" in track_condition_base:
+                            tr = track_condition_base["track_resolution"]
+                            track_condition_input["track_resolution"] = torch.cat([tr, tr], dim=0)
+                    elif do_text_only_guidance:
+                        # Force motion-null on both branches: [v(c_t,c_m_null), v(c_null,c_m_null)].
+                        track_condition_input = {
+                            "tracks": torch.cat(
+                                [
+                                    torch.zeros_like(track_condition_base["tracks"]),
+                                    torch.zeros_like(track_condition_base["tracks"]),
+                                ],
+                                dim=0,
+                            ),
+                            "visibility": torch.cat(
+                                [
+                                    torch.zeros_like(track_condition_base["visibility"]),
+                                    torch.zeros_like(track_condition_base["visibility"]),
+                                ],
+                                dim=0,
+                            ),
+                        }
+                        if "point_mask" in track_condition_base:
+                            zeros_mask = torch.zeros_like(track_condition_base["point_mask"])
+                            track_condition_input["point_mask"] = torch.cat([zeros_mask, zeros_mask], dim=0)
+                        if "is_normalized" in track_condition_base:
+                            inorm = track_condition_base["is_normalized"]
+                            track_condition_input["is_normalized"] = torch.cat(
+                                [inorm, inorm], dim=0
+                            )
+                        if "track_resolution" in track_condition_base:
+                            tr = track_condition_base["track_resolution"]
+                            track_condition_input["track_resolution"] = torch.cat([tr, tr], dim=0)
+                    elif do_motion_only_guidance:
+                        # Keep motion only on first branch: [v(c_null,c_m), v(c_null,c_m_null)].
+                        track_condition_input = {
+                            "tracks": torch.cat(
+                                [
+                                    track_condition_base["tracks"],
+                                    torch.zeros_like(track_condition_base["tracks"]),
+                                ],
+                                dim=0,
+                            ),
+                            "visibility": torch.cat(
+                                [
+                                    track_condition_base["visibility"],
+                                    torch.zeros_like(track_condition_base["visibility"]),
+                                ],
+                                dim=0,
+                            ),
+                        }
+                        if "point_mask" in track_condition_base:
+                            track_condition_input["point_mask"] = torch.cat(
+                                [
+                                    track_condition_base["point_mask"],
+                                    torch.zeros_like(track_condition_base["point_mask"]),
+                                ],
+                                dim=0,
+                            )
+                        if "is_normalized" in track_condition_base:
+                            inorm = track_condition_base["is_normalized"]
+                            track_condition_input["is_normalized"] = torch.cat(
+                                [inorm, inorm], dim=0
+                            )
+                        if "track_resolution" in track_condition_base:
+                            tr = track_condition_base["track_resolution"]
+                            track_condition_input["track_resolution"] = torch.cat([tr, tr], dim=0)
+                    elif do_classifier_free_guidance:
                         # CFG: keep track conditioning only on the conditional branch.
                         # Unconditional half receives zeros/None semantics by zeroing the
                         # tensors while preserving batch shape for the transformer call.
@@ -779,6 +1053,11 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                                     track_condition_base["point_mask"],
                                 ],
                                 dim=0,
+                            )
+                        if "is_normalized" in track_condition_base:
+                            inorm = track_condition_base["is_normalized"]
+                            track_condition_input["is_normalized"] = torch.cat(
+                                [inorm, inorm], dim=0
                             )
                         if "track_resolution" in track_condition_base:
                             tr = track_condition_base["track_resolution"]
@@ -837,7 +1116,29 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                     )
 
                 # perform guidance
-                if do_classifier_free_guidance:
+                if do_joint_guidance:
+                    v_tm, v_um, v_tu = noise_pred.chunk(3)
+                    wt = float(text_guidance_weight)
+                    wm = float(motion_guidance_weight)
+                    alpha = wt / (wt + wm)
+                    v_base = alpha * v_um + (1.0 - alpha) * v_tu
+                    noise_pred = v_base + wt * (v_tm - v_um) + wm * (v_tm - v_tu)
+                elif do_unified_guidance:
+                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.guidance_scale * (
+                        noise_pred_cond - noise_pred_uncond
+                    )
+                elif do_text_only_guidance:
+                    # v = wt * v(c_t,c_m_null) + (1-wt) * v(c_null,c_m_null)
+                    v_t, v_u = noise_pred.chunk(2)
+                    wt = float(text_guidance_weight)
+                    noise_pred = wt * v_t + (1.0 - wt) * v_u
+                elif do_motion_only_guidance:
+                    # v = wm * v(c_null,c_m) + (1-wm) * v(c_null,c_m_null)
+                    v_m, v_u = noise_pred.chunk(2)
+                    wm = float(motion_guidance_weight)
+                    noise_pred = wm * v_m + (1.0 - wm) * v_u
+                elif do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 

@@ -672,7 +672,160 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.all_gather = None
         self.sp_world_size = 1
         self.sp_world_rank = 0
+        self._last_patch_group_analysis: Dict[str, float] = {}
         self.init_weights()
+
+    def _want_patch_group_analysis(self) -> bool:
+        return os.environ.get("WAN_PATCH_GROUP_ANALYSIS") == "1"
+
+    def _should_patch_group_analysis(self, cond_flag: bool) -> bool:
+        return (
+            self._want_patch_group_analysis()
+            and bool(cond_flag)
+            and int(getattr(self, "current_steps", 0)) == 0
+        )
+
+    def _analysis_print(self, prefix: str, message: str) -> None:
+        if self._want_patch_group_analysis() and int(getattr(self, "current_steps", 0)) == 0:
+            print(f"[analysis_patch_group] {prefix}: {message}")
+
+    def get_last_patch_group_analysis(self) -> Dict[str, float]:
+        return dict(self._last_patch_group_analysis)
+
+    @torch.no_grad()
+    def _analyze_patch_group_contrib(self, x: torch.Tensor) -> Dict[str, float]:
+        patch = self.patch_embedding
+        if not isinstance(patch, nn.Conv3d):
+            self._analysis_print(
+                "patch_group_contrib",
+                f"skip: patch_embedding is not Conv3d ({type(patch).__name__})",
+            )
+            return {}
+        if x.ndim != 5:
+            self._analysis_print(
+                "patch_group_contrib",
+                f"skip: expected x.ndim=5, got {x.ndim}",
+            )
+            return {}
+        if patch.groups != 1:
+            self._analysis_print(
+                "patch_group_contrib",
+                f"skip: patch.groups={patch.groups} (only groups=1 is supported)",
+            )
+            return {}
+
+        expected_c = int(patch.in_channels)
+        input_c = int(x.shape[1])
+        if input_c != expected_c:
+            self._analysis_print(
+                "patch_group_contrib",
+                f"warn: x channels ({input_c}) != patch.in_channels ({expected_c})",
+            )
+        if input_c < 36:
+            self._analysis_print(
+                "patch_group_contrib",
+                f"skip: need at least 36 channels for base layout, got {input_c}",
+            )
+            return {}
+
+        layout: Dict[str, tuple[int, int]] = {
+            "noisy": (0, 16),
+            "mask": (16, 20),
+            "first": (20, 36),
+        }
+        if input_c >= 52:
+            layout["track"] = (36, 52)
+
+        if any(end > expected_c for _, end in layout.values()):
+            self._analysis_print(
+                "patch_group_contrib",
+                (
+                    "skip: layout exceeds patch.in_channels "
+                    f"(layout_end={max(end for _, end in layout.values())}, patch_in={expected_c})"
+                ),
+            )
+            return {}
+
+        x_in = x.detach().to(device=patch.weight.device, dtype=patch.weight.dtype)
+        w = patch.weight.detach()
+        conv_kwargs = {
+            "stride": patch.stride,
+            "padding": patch.padding,
+            "dilation": patch.dilation,
+            "groups": 1,
+        }
+        eps = 1e-12
+
+        def _rms(tensor: torch.Tensor) -> float:
+            return float(tensor.float().pow(2).mean().sqrt().item())
+
+        def _safe_div(num: float, den: float) -> float:
+            return float(num / max(den, eps))
+
+        stats: Dict[str, float] = {}
+        for name, (start, end) in layout.items():
+            stats[f"input/{name}_rms"] = _rms(x_in[:, start:end, ...])
+
+        if "track" in layout:
+            stats["input/track_to_noisy"] = _safe_div(
+                stats["input/track_rms"],
+                stats["input/noisy_rms"],
+            )
+            stats["input/track_to_first"] = _safe_div(
+                stats["input/track_rms"],
+                stats["input/first_rms"],
+            )
+
+        contribs: Dict[str, torch.Tensor] = {}
+        for name, (start, end) in layout.items():
+            contribs[name] = torch.nn.functional.conv3d(
+                x_in[:, start:end, ...],
+                w[:, start:end, ...].contiguous(),
+                bias=None,
+                **conv_kwargs,
+            )
+
+        total_no_bias: Optional[torch.Tensor] = None
+        for out in contribs.values():
+            total_no_bias = out if total_no_bias is None else (total_no_bias + out)
+        if total_no_bias is None:
+            self._analysis_print("patch_group_contrib", "skip: no valid channel groups")
+            return {}
+
+        total_no_bias_rms = _rms(total_no_bias)
+        stats["patch/total_no_bias_rms"] = total_no_bias_rms
+
+        for name, out in contribs.items():
+            value = _rms(out)
+            stats[f"patch/{name}_rms"] = value
+            stats[f"patch/{name}_to_total"] = _safe_div(value, total_no_bias_rms)
+
+        if "track" in layout:
+            stats["patch/track_to_noisy"] = _safe_div(
+                stats["patch/track_rms"],
+                stats["patch/noisy_rms"],
+            )
+            stats["patch/track_to_first"] = _safe_div(
+                stats["patch/track_rms"],
+                stats["patch/first_rms"],
+            )
+
+        if patch.bias is not None and input_c == expected_c:
+            total_with_bias = torch.nn.functional.conv3d(
+                x_in,
+                w,
+                bias=patch.bias.detach(),
+                stride=patch.stride,
+                padding=patch.padding,
+                dilation=patch.dilation,
+                groups=patch.groups,
+            )
+            stats["patch/total_with_bias_rms"] = _rms(total_with_bias)
+
+        self._last_patch_group_analysis.update(stats)
+        pretty_stats = ", ".join(f"{k}={v:.6f}" for k, v in sorted(stats.items()))
+        self._analysis_print("patch_group_contrib", pretty_stats)
+        return stats
 
     def _set_gradient_checkpointing(self, *args, **kwargs):
         if "value" in kwargs:
@@ -822,6 +975,19 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+        if self._should_patch_group_analysis(cond_flag=cond_flag):
+            try:
+                if isinstance(x, torch.Tensor):
+                    patch_input = x
+                else:
+                    patch_input = torch.stack(list(x), dim=0)
+                self._analyze_patch_group_contrib(patch_input)
+            except Exception as err:
+                self._analysis_print(
+                    "warn",
+                    f"patch group analysis failed: {type(err).__name__}: {err}",
+                )
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]

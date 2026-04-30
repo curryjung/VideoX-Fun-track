@@ -21,6 +21,7 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = BASE_DIR / "data"
 TRACK_DIR = DATA_DIR / "tracks"
 IMAGE_DIR = DATA_DIR / "images"
+FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 
 TRACK_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,6 +134,44 @@ def list_tracks() -> dict[str, list[str]]:
     return {"track_ids": ids}
 
 
+@app.post("/api/export/package")
+async def export_package(
+    directory: str = Form(...),
+    image: UploadFile = File(...),
+    tracks_npz: UploadFile = File(...),
+    caption: str = Form(""),
+    preview_png: UploadFile | None = File(default=None),
+) -> dict:
+    target_dir = Path(directory)
+    if not target_dir.is_absolute():
+        target_dir = DATA_DIR / directory
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: dict[str, str] = {}
+
+    image_path = target_dir / "first_frame.png"
+    image_path.write_bytes(await image.read())
+    saved["image"] = str(image_path)
+
+    tracks_path = target_dir / "transformed_tracks_grid50_survived.npz"
+    tracks_path.write_bytes(await tracks_npz.read())
+    saved["tracks"] = str(tracks_path)
+
+    if caption.strip():
+        caption_path = target_dir / "image_caption.txt"
+        caption_path.write_text(caption, encoding="utf-8")
+        saved["caption"] = str(caption_path)
+
+    if preview_png is not None:
+        preview_bytes = await preview_png.read()
+        if preview_bytes:
+            preview_path = target_dir / "track_preview.png"
+            preview_path.write_bytes(preview_bytes)
+            saved["preview"] = str(preview_path)
+
+    return {"status": "ok", "directory": str(target_dir), "saved": saved}
+
+
 @app.post("/api/images/caption", response_model=ImageCaptionResponse)
 async def caption_image(
     file: UploadFile = File(...),
@@ -178,3 +217,8 @@ async def caption_image(
         text=_extract_caption_text(parsed_answer),
         raw_output=parsed_answer,
     )
+
+
+# Serve frontend SPA — must be mounted last so /api/* routes take priority
+if FRONTEND_DIST.exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")

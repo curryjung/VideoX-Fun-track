@@ -49,7 +49,7 @@ spec:
 
           containers:
             - name: pytorch
-              image: <registry>/<repo>/videox-fun:<tag>
+              image: jetejeong541/videox-fun-track:v1
               imagePullPolicy: IfNotPresent
               command: ["bash", "-c"]
               args:

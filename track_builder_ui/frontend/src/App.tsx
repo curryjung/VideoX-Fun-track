@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import JSZip from "jszip";
 import TrackCanvas from "./components/TrackCanvas";
 import TrackPreview from "./components/TrackPreview";
@@ -133,6 +133,10 @@ function clonePoints(points: { x: number; y: number }[]): { x: number; y: number
   return points.map((point) => ({ x: point.x, y: point.y }));
 }
 
+function getTrackMode(path: TrackPath | null | undefined): "moving" | "static" {
+  return path?.trackMode === "static" ? "static" : "moving";
+}
+
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
@@ -156,6 +160,7 @@ function parseTrackPath(value: unknown): TrackPath | null {
   const candidate = value as Partial<TrackPath> & {
     pointMode?: unknown;
     keyframes?: unknown;
+    trackMode?: unknown;
   };
   if (
     typeof candidate.id !== "string" ||
@@ -170,6 +175,7 @@ function parseTrackPath(value: unknown): TrackPath | null {
     candidate.pointMode === "points" || candidate.pointMode === "polyline"
       ? candidate.pointMode
       : "points";
+  const trackMode = candidate.trackMode === "static" ? "static" : "moving";
   const keyframes = Array.isArray(candidate.keyframes)
     ? candidate.keyframes.filter((frame): frame is { x: number; y: number }[] => isPointArray(frame))
     : undefined;
@@ -179,6 +185,7 @@ function parseTrackPath(value: unknown): TrackPath | null {
     name: candidate.name,
     points: clonePoints(candidate.points),
     keyframes,
+    trackMode,
     pointMode,
     closed: candidate.closed,
     color: candidate.color
@@ -291,6 +298,15 @@ function ensureKeyframes(
     resized.push(clonePoints(fallback));
   }
   return resized;
+}
+
+function createStaticKeyframes(
+  points: { x: number; y: number }[],
+  frameCount: number
+): { x: number; y: number }[][] {
+  return Array.from({ length: Math.max(1, frameCount) }, () =>
+    clonePoints(points)
+  );
 }
 
 function makeNpyBuffer(
@@ -417,16 +433,21 @@ export default function App(): JSX.Element {
   const [gridRows, setGridRows] = useState<number>(8);
   const [gridCols, setGridCols] = useState<number>(8);
   const [pointCloudShape, setPointCloudShape] = useState<"square" | "circle">("square");
+  const [isStaticPointCloud, setIsStaticPointCloud] = useState<boolean>(false);
   const [currentFrame, setCurrentFrame] = useState<number>(0);
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [isRecordingCompleted, setIsRecordingCompleted] = useState<boolean>(false);
   const [pointSpacingScale, setPointSpacingScale] = useState<number>(1.0);
-  const [captionTask, setCaptionTask] = useState<string>(DEFAULT_FLORENCE_TASK);
-  const [generatedCaption, setGeneratedCaption] = useState<string>("");
-  const [isCaptioning, setIsCaptioning] = useState<boolean>(false);
+  const pointSpacingScaleRef = useRef<number>(1.0);
+  // const [captionTask, setCaptionTask] = useState<string>(DEFAULT_FLORENCE_TASK);
+  // const [generatedCaption, setGeneratedCaption] = useState<string>("");
+  // const [isCaptioning, setIsCaptioning] = useState<boolean>(false);
   const [status, setStatus] = useState<string>(
     "Ready - Create point cloud and drag it across 81 frames"
   );
+  const [serverExportPath, setServerExportPath] = useState<string>("/data/project-vilab/jaeseok/VideoX-Fun/asset/track_samples/");
+  const [serverExportSubDir, setServerExportSubDir] = useState<string>("");
+  const [localDownload, setLocalDownload] = useState<boolean>(true);
 
   useEffect(() => {
     if (image) {
@@ -463,6 +484,7 @@ export default function App(): JSX.Element {
     () => paths.find((path) => path.id === selectedPathId) ?? null,
     [paths, selectedPathId]
   );
+  const selectedTrackMode = getTrackMode(selectedPath);
 
   const selectedDisplayPath = useMemo(
     () => displayPaths.find((path) => path.id === selectedPathId) ?? null,
@@ -472,6 +494,15 @@ export default function App(): JSX.Element {
   const targetPointCount = useMemo(
     () => clampGridCount(gridRows) * clampGridCount(gridCols),
     [gridCols, gridRows]
+  );
+
+  const totalPointCount = useMemo(
+    () =>
+      paths.reduce(
+        (sum, path) => sum + (path.keyframes?.[0]?.length ?? path.points.length),
+        0
+      ),
+    [paths]
   );
 
   useEffect(() => {
@@ -513,7 +544,7 @@ export default function App(): JSX.Element {
       }
       setImage(processedImage);
       setImageSrc(processedSrc);
-      setGeneratedCaption("");
+      // setGeneratedCaption("");
       setStatus(
         `Loaded and resized to ${DEFAULT_IMAGE_WIDTH}x${DEFAULT_IMAGE_HEIGHT} (source ${original.width}x${original.height})`
       );
@@ -577,11 +608,71 @@ export default function App(): JSX.Element {
 
     setPaths((prev) => prev.filter((path) => path.id !== selectedPathId));
     setSelectedPathId(null);
+    setIsRecording(false);
     setIsRecordingCompleted(false);
+    setCurrentFrame(0);
+    setGridRows(8);
+    setGridCols(8);
+    setPointCloudShape("square");
+    setIsStaticPointCloud(false);
+    pointSpacingScaleRef.current = 1.0;
+    setPointSpacingScale(1.0);
+    setGrid((prev) => ({ ...prev, spacing: 50 }));
     setStatus("Deleted selected path");
   };
 
-  const createOrUpdatePointCloudPath = (): void => {
+  const applyStaticPoseToSelectedPath = (statusMessage?: string): void => {
+    if (!selectedPathId) {
+      setStatus("Select a point cloud first");
+      return;
+    }
+
+    setPaths((prevPaths) =>
+      prevPaths.map((path) => {
+        if (path.id !== selectedPathId) {
+          return path;
+        }
+        const keyframes = ensureKeyframes(path, FRAME_COUNT);
+        const source = clonePoints(keyframes[currentFrame] ?? keyframes[0] ?? path.points);
+        return {
+          ...path,
+          trackMode: "static",
+          points: source,
+          keyframes: createStaticKeyframes(source, FRAME_COUNT)
+        };
+      })
+    );
+    setCurrentFrame(0);
+    setIsRecording(false);
+    setIsRecordingCompleted(true);
+    setStatus(statusMessage ?? "Made selected point cloud static across all 81 frames");
+  };
+
+  const handleStaticPointCloudToggle = (checked: boolean): void => {
+    setIsStaticPointCloud(checked);
+    setStatus(
+      checked
+        ? "New point-cloud tracks will be static"
+        : "New point-cloud tracks will be moving"
+    );
+  };
+
+  const makeSelectedPathMoving = (): void => {
+    if (!selectedPathId) {
+      setStatus("Select a point cloud first");
+      return;
+    }
+
+    setPaths((prevPaths) =>
+      prevPaths.map((path) =>
+        path.id === selectedPathId ? { ...path, trackMode: "moving" } : path
+      )
+    );
+    setIsRecordingCompleted(false);
+    setStatus("Selected track is now moving - use Recording ON to create motion over time");
+  };
+
+  const createOrUpdatePointCloudPath = (forceNew = false): void => {
     const rows = clampGridCount(gridRows);
     const cols = clampGridCount(gridCols);
     const spacing = Math.max(4, Math.round(grid.spacing));
@@ -592,59 +683,78 @@ export default function App(): JSX.Element {
         ? createCirclePoints(rows * cols, spacing, width, height)
         : createSquareGridPoints(rows, cols, spacing, width, height);
     const shapeLabel = pointCloudShape === "circle" ? "circle" : "square";
+    const newTrackMode = isStaticPointCloud ? "static" : "moving";
 
-    if (selectedPathId) {
+    if (selectedPathId && !forceNew) {
+      const updatedTrackMode = selectedTrackMode;
       setPaths((prev) =>
         prev.map((path) =>
           path.id === selectedPathId
             ? {
                 ...path,
                 points,
-                keyframes: Array.from({ length: FRAME_COUNT }, () =>
-                  clonePoints(points)
-                ),
+                keyframes: createStaticKeyframes(points, FRAME_COUNT),
+                trackMode: updatedTrackMode,
                 pointMode: "points"
               }
             : path
         )
       );
+      pointSpacingScaleRef.current = 1.0;
+      setPointSpacingScale(1.0);
       setStatus(
-        `Updated selected path as ${shapeLabel} point cloud (${points.length} points)`
+        updatedTrackMode === "static"
+          ? `Updated selected path as static ${shapeLabel} point cloud (${points.length} points)`
+          : `Updated selected path as ${shapeLabel} point cloud (${points.length} points)`
       );
-      setIsRecordingCompleted(false);
+      setCurrentFrame(0);
+      setIsRecording(false);
+      setIsRecordingCompleted(updatedTrackMode === "static");
       return;
     }
 
     const newPath: TrackPath = {
       id: generatePathId(),
       name:
-        pointCloudShape === "circle"
+        newTrackMode === "static"
+          ? pointCloudShape === "circle"
+            ? `Static Circle ${rows * cols}pts`
+            : `Static Grid ${rows}x${cols}`
+          : pointCloudShape === "circle"
           ? `Circle ${rows * cols}pts`
           : `Grid ${rows}x${cols}`,
       points,
-      keyframes: Array.from({ length: FRAME_COUNT }, () =>
-        clonePoints(points)
-      ),
+      keyframes: createStaticKeyframes(points, FRAME_COUNT),
+      trackMode: newTrackMode,
       pointMode: "points",
       closed: false,
       color: "#00d7ff"
     };
     setPaths((prev) => [...prev, newPath]);
     setSelectedPathId(newPath.id);
-    setIsRecordingCompleted(false);
-    setStatus(`Created ${shapeLabel} point cloud (${points.length} points)`);
+    setPointSpacingScale(1.0);
+    setCurrentFrame(0);
+    setIsRecording(false);
+    setIsRecordingCompleted(newTrackMode === "static");
+    setStatus(
+      newTrackMode === "static"
+        ? `Created static ${shapeLabel} point cloud (${points.length} points)`
+        : `Created ${shapeLabel} point cloud (${points.length} points)`
+    );
   };
 
   const handlePointSpacingScaleChange = (nextScale: number): void => {
     const clamped = Math.max(0.2, Math.min(3.0, nextScale));
     if (!selectedPathId) {
+      pointSpacingScaleRef.current = clamped;
       setPointSpacingScale(clamped);
       return;
     }
 
-    const prevScale = Math.max(0.2, Math.min(3.0, pointSpacingScale));
+    const prevScale = Math.max(0.2, Math.min(3.0, pointSpacingScaleRef.current));
     const ratio = clamped / prevScale;
     if (!Number.isFinite(ratio) || ratio <= 0) {
+      pointSpacingScaleRef.current = clamped;
       setPointSpacingScale(clamped);
       return;
     }
@@ -664,6 +774,7 @@ export default function App(): JSX.Element {
         };
       })
     );
+    pointSpacingScaleRef.current = clamped;
     setPointSpacingScale(clamped);
   };
 
@@ -688,17 +799,25 @@ export default function App(): JSX.Element {
         }
         const keyframes = ensureKeyframes(path, FRAME_COUNT);
         const source = clonePoints(keyframes[currentFrame] ?? keyframes[0] ?? []);
-        keyframes[0] = source;
+        const isPathStatic = getTrackMode(path) === "static";
+        const nextKeyframes = isPathStatic
+          ? createStaticKeyframes(source, FRAME_COUNT)
+          : keyframes;
+        nextKeyframes[0] = source;
         return {
           ...path,
           points: source,
-          keyframes
+          keyframes: nextKeyframes
         };
       })
     );
     setCurrentFrame(0);
-    setIsRecordingCompleted(false);
-    setStatus("Set current point cloud pose as start frame (frame 1)");
+    setIsRecordingCompleted(selectedTrackMode === "static");
+    setStatus(
+      selectedTrackMode === "static"
+        ? "Set current point cloud pose as static track across all frames"
+        : "Set current point cloud pose as start frame (frame 1)"
+    );
   };
 
   const handlePathDrag = (pathId: string, dx: number, dy: number): void => {
@@ -717,14 +836,36 @@ export default function App(): JSX.Element {
           x: point.x + dx,
           y: point.y + dy
         }));
-        keyframes[currentFrame] = movedPoints;
+        const nextKeyframes = getTrackMode(path) === "static"
+          ? createStaticKeyframes(movedPoints, FRAME_COUNT)
+          : keyframes;
+        nextKeyframes[currentFrame] = movedPoints;
         return {
           ...path,
           points: movedPoints,
-          keyframes
+          keyframes: nextKeyframes
         };
       })
     );
+  };
+
+  const handleStopRecording = (): void => {
+    setPaths((prevPaths) =>
+      prevPaths.map((path) => {
+        if (path.id !== selectedPathId) {
+          return path;
+        }
+        const kf = ensureKeyframes(path, FRAME_COUNT);
+        const lastPos = kf[currentFrame] ?? kf[0] ?? [];
+        for (let f = currentFrame + 1; f < FRAME_COUNT; f++) {
+          kf[f] = clonePoints(lastPos);
+        }
+        return { ...path, keyframes: kf };
+      })
+    );
+    setIsRecording(false);
+    setIsRecordingCompleted(true);
+    setStatus("Recording complete");
   };
 
   const handleRecordTick = (pathId: string): void => {
@@ -738,6 +879,9 @@ export default function App(): JSX.Element {
       setPaths((prevPaths) =>
         prevPaths.map((path) => {
           if (path.id !== pathId) {
+            return path;
+          }
+          if (getTrackMode(path) === "static") {
             return path;
           }
 
@@ -793,8 +937,18 @@ export default function App(): JSX.Element {
   };
 
   const exportTrackPackage = async (): Promise<void> => {
-    const targetPath = selectedPath ?? paths[0] ?? null;
-    if (!targetPath) {
+    const exportPaths = paths
+      .map((path) => {
+        const keyframes = ensureKeyframes(path, FRAME_COUNT);
+        return {
+          path,
+          keyframes,
+          pointCount: keyframes[0]?.length ?? 0
+        };
+      })
+      .filter((item) => item.pointCount > 0);
+
+    if (exportPaths.length === 0) {
       setStatus("No path available to export");
       return;
     }
@@ -804,30 +958,34 @@ export default function App(): JSX.Element {
     }
 
     try {
-      const keyframes = ensureKeyframes(targetPath, FRAME_COUNT);
-      const pointCount = keyframes[0]?.length ?? 0;
+      const pointCount = exportPaths.reduce((sum, item) => sum + item.pointCount, 0);
       if (pointCount <= 0) {
-        setStatus("Selected path has no points");
+        setStatus("No point-cloud points available to export");
         return;
       }
 
       const tracks = new Float32Array(FRAME_COUNT * pointCount * 2);
       const visibility = new Float32Array(FRAME_COUNT * pointCount);
-      for (let frame = 0; frame < FRAME_COUNT; frame += 1) {
-        const framePoints = keyframes[frame] ?? [];
-        for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
-          const point = framePoints[pointIndex];
-          const baseTrackIdx = (frame * pointCount + pointIndex) * 2;
-          if (point) {
-            tracks[baseTrackIdx] = point.x;
-            tracks[baseTrackIdx + 1] = point.y;
-            visibility[frame * pointCount + pointIndex] = 1;
-          } else {
-            tracks[baseTrackIdx] = 0;
-            tracks[baseTrackIdx + 1] = 0;
-            visibility[frame * pointCount + pointIndex] = 0;
+      let pointOffset = 0;
+      for (const item of exportPaths) {
+        for (let frame = 0; frame < FRAME_COUNT; frame += 1) {
+          const framePoints = item.keyframes[frame] ?? [];
+          for (let localPointIndex = 0; localPointIndex < item.pointCount; localPointIndex += 1) {
+            const globalPointIndex = pointOffset + localPointIndex;
+            const point = framePoints[localPointIndex];
+            const baseTrackIdx = (frame * pointCount + globalPointIndex) * 2;
+            if (point) {
+              tracks[baseTrackIdx] = point.x;
+              tracks[baseTrackIdx + 1] = point.y;
+              visibility[frame * pointCount + globalPointIndex] = 1;
+            } else {
+              tracks[baseTrackIdx] = 0;
+              tracks[baseTrackIdx + 1] = 0;
+              visibility[frame * pointCount + globalPointIndex] = 0;
+            }
           }
         }
+        pointOffset += item.pointCount;
       }
 
       const validIdx = new BigInt64Array(pointCount);
@@ -838,27 +996,15 @@ export default function App(): JSX.Element {
       const trackNpzZip = new JSZip();
       trackNpzZip.file(
         "tracks_compressed.npy",
-        makeNpyBuffer(
-          "<f4",
-          [FRAME_COUNT, pointCount, 2],
-          typedArrayBytes(tracks)
-        )
+        makeNpyBuffer("<f4", [FRAME_COUNT, pointCount, 2], typedArrayBytes(tracks))
       );
       trackNpzZip.file(
         "visibility_compressed.npy",
-        makeNpyBuffer(
-          "<f4",
-          [FRAME_COUNT, pointCount],
-          typedArrayBytes(visibility)
-        )
+        makeNpyBuffer("<f4", [FRAME_COUNT, pointCount], typedArrayBytes(visibility))
       );
       trackNpzZip.file(
         "valid_idx.npy",
-        makeNpyBuffer(
-          "<i8",
-          [pointCount],
-          typedArrayBytes(validIdx)
-        )
+        makeNpyBuffer("<i8", [pointCount], typedArrayBytes(validIdx))
       );
       const trackNpzBlob = await trackNpzZip.generateAsync({
         type: "blob",
@@ -873,42 +1019,125 @@ export default function App(): JSX.Element {
         setStatus("Failed to export first frame image");
         return;
       }
-      drawCenterCropCover(
-        firstFrameCtx,
-        image,
-        DEFAULT_IMAGE_WIDTH,
-        DEFAULT_IMAGE_HEIGHT
-      );
+      drawCenterCropCover(firstFrameCtx, image, DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT);
       const firstFrameBlob = await canvasToPngBlob(firstFrameCanvas);
 
-      const packageZip = new JSZip();
-      const exportDir = "processed_832x480_fps16";
-      packageZip.file(`${exportDir}/first_frame.png`, firstFrameBlob);
-      packageZip.file(
-        `${exportDir}/transformed_tracks_grid50_survived.npz`,
-        trackNpzBlob
-      );
-      const captionFileContent = [
-        `task_prompt: ${captionTask.trim() || DEFAULT_FLORENCE_TASK}`,
-        `generated_at: ${new Date().toISOString()}`,
-        "",
-        generatedCaption.trim() || "(empty caption)"
-      ].join("\n");
-      packageZip.file(`${exportDir}/image_caption.txt`, captionFileContent);
-      const packageBlob = await packageZip.generateAsync({
-        type: "blob",
-        compression: "DEFLATE"
-      });
+      // Generate track preview PNG (all trajectories overlaid on first frame)
+      const previewCanvas = document.createElement("canvas");
+      previewCanvas.width = DEFAULT_IMAGE_WIDTH;
+      previewCanvas.height = DEFAULT_IMAGE_HEIGHT;
+      const previewCtx = previewCanvas.getContext("2d");
+      let previewBlob: Blob | null = null;
+      if (previewCtx) {
+        drawCenterCropCover(previewCtx, image, DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT);
+        let globalPointIndex = 0;
+        for (const item of exportPaths) {
+          for (let pi = 0; pi < item.pointCount; pi += 1) {
+            const hue = (globalPointIndex * 137.508) % 360;
+            const h = hue / 60;
+            const s = 0.9, l = 0.6;
+            const c = (1 - Math.abs(2 * l - 1)) * s;
+            const x = c * (1 - Math.abs(h % 2 - 1));
+            const m = l - c / 2;
+            let r = 0, g = 0, b = 0;
+            if (h < 1) { r = c; g = x; } else if (h < 2) { r = x; g = c; } else if (h < 3) { g = c; b = x; } else if (h < 4) { g = x; b = c; } else if (h < 5) { r = x; b = c; } else { r = c; b = x; }
+            const cr = Math.round((r + m) * 255), cg = Math.round((g + m) * 255), cb = Math.round((b + m) * 255);
+            previewCtx.save();
+            previewCtx.strokeStyle = `rgb(${cr},${cg},${cb})`;
+            previewCtx.lineWidth = 1.5;
+            previewCtx.globalAlpha = getTrackMode(item.path) === "static" ? 0.35 : 0.75;
+            previewCtx.beginPath();
+            const firstPt = item.keyframes[0][pi];
+            if (firstPt) {
+              previewCtx.moveTo(firstPt.x, firstPt.y);
+              for (let t = 1; t < FRAME_COUNT; t += 1) {
+                const p = item.keyframes[t][pi];
+                if (p) previewCtx.lineTo(p.x, p.y);
+              }
+            }
+            previewCtx.stroke();
+            previewCtx.restore();
+            const endPt = item.keyframes[FRAME_COUNT - 1][pi];
+            if (endPt) {
+              previewCtx.beginPath();
+              previewCtx.fillStyle = `rgb(${cr},${cg},${cb})`;
+              previewCtx.arc(endPt.x, endPt.y, 3.5, 0, Math.PI * 2);
+              previewCtx.fill();
+            }
+            globalPointIndex += 1;
+          }
+        }
+        previewBlob = await canvasToPngBlob(previewCanvas);
+      }
 
-      const url = URL.createObjectURL(packageBlob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = "processed_832x480_fps16.zip";
-      link.click();
-      URL.revokeObjectURL(url);
-      setStatus(
-        `Exported track package (+ image_caption.txt): ${FRAME_COUNT} frames, ${pointCount} points`
-      );
+      // const captionFileContent = [
+      //   `task_prompt: ${captionTask.trim() || DEFAULT_FLORENCE_TASK}`,
+      //   `generated_at: ${new Date().toISOString()}`,
+      //   "",
+      //   generatedCaption.trim() || "(empty caption)"
+      // ].join("\n");
+
+      // Server export
+      const baseDir = serverExportPath.trim();
+      if (baseDir) {
+        const userSubDir = serverExportSubDir.trim();
+        let subDir: string;
+        if (userSubDir) {
+          subDir = userSubDir;
+        } else {
+          const now = new Date();
+          subDir = `track_${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
+        }
+        const exportDir = baseDir.endsWith("/") ? `${baseDir}${subDir}` : `${baseDir}/${subDir}`;
+        const formData = new FormData();
+        formData.append("directory", exportDir);
+        formData.append("image", firstFrameBlob, "first_frame.png");
+        formData.append("tracks_npz", trackNpzBlob, "transformed_tracks_grid50_survived.npz");
+        // formData.append("caption", captionFileContent);
+        if (previewBlob) {
+          formData.append("preview_png", previewBlob, "track_preview.png");
+        }
+        const resp = await fetch(buildApiUrl("/api/export/package"), {
+          method: "POST",
+          body: formData
+        });
+        if (!resp.ok) {
+          const errText = await resp.text();
+          setStatus(`Server export failed: ${errText}`);
+          return;
+        }
+        const result = await resp.json() as { directory: string };
+        setStatus(`Saved to server: ${result.directory} (${FRAME_COUNT} frames, ${pointCount} pts, ${exportPaths.length} tracks)`);
+      }
+
+      // Local download
+      if (localDownload) {
+        const packageZip = new JSZip();
+        const exportDir = "processed_832x480_fps16";
+        packageZip.file(`${exportDir}/first_frame.png`, firstFrameBlob);
+        packageZip.file(`${exportDir}/transformed_tracks_grid50_survived.npz`, trackNpzBlob);
+        // packageZip.file(`${exportDir}/image_caption.txt`, captionFileContent);
+        if (previewBlob) {
+          packageZip.file(`${exportDir}/track_preview.png`, previewBlob);
+        }
+        const packageBlob = await packageZip.generateAsync({
+          type: "blob",
+          compression: "DEFLATE"
+        });
+        const url = URL.createObjectURL(packageBlob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "processed_832x480_fps16.zip";
+        link.click();
+        URL.revokeObjectURL(url);
+        if (!baseDir) {
+          setStatus(`Exported track package: ${FRAME_COUNT} frames, ${pointCount} points, ${exportPaths.length} tracks`);
+        }
+      }
+
+      if (!baseDir && !localDownload) {
+        setStatus("Nothing exported — set a server path or enable local download.");
+      }
     } catch (error) {
       setStatus(
         error instanceof Error
@@ -935,6 +1164,7 @@ export default function App(): JSX.Element {
       setPaths(
         parsed.paths.map((path) => ({
           ...path,
+          trackMode: getTrackMode(path),
           pointMode: "points",
           keyframes: ensureKeyframes(path, FRAME_COUNT)
         }))
@@ -952,7 +1182,7 @@ export default function App(): JSX.Element {
         img.onload = () => setImage(img);
         img.src = parsed.image.src;
         setImageSrc(parsed.image.src);
-        setGeneratedCaption("");
+        // setGeneratedCaption("");
       }
 
       setStatus("Imported track document");
@@ -965,53 +1195,53 @@ export default function App(): JSX.Element {
     }
   };
 
-  const generateImageCaption = async (): Promise<void> => {
-    if (!imageSrc) {
-      setStatus("Load image first");
-      return;
-    }
-    const imageBlob = dataUrlToBlob(imageSrc);
-    if (!imageBlob) {
-      setStatus("Unsupported image source for captioning");
-      return;
-    }
-
-    setIsCaptioning(true);
-    setStatus("Generating Florence caption...");
-    try {
-      const formData = new FormData();
-      formData.append("file", imageBlob, "track_builder_input.png");
-      formData.append("task", captionTask.trim() || DEFAULT_FLORENCE_TASK);
-
-      const response = await fetch(buildApiUrl("/api/images/caption"), {
-        method: "POST",
-        body: formData
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(errorText || `HTTP ${response.status}`);
-      }
-      const payload = (await response.json()) as {
-        text?: string;
-        task?: string;
-      };
-      const nextCaption = payload.text?.trim() ?? "";
-      if (!nextCaption) {
-        setGeneratedCaption("");
-        setStatus("Caption response is empty");
-        return;
-      }
-      setGeneratedCaption(nextCaption);
-      setStatus(`Caption generated with task ${payload.task ?? captionTask}`);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : "unknown error";
-      setStatus(
-        `Caption failed: ${reason} (check backend on :8000 or set VITE_BACKEND_URL)`
-      );
-    } finally {
-      setIsCaptioning(false);
-    }
-  };
+  // const generateImageCaption = async (): Promise<void> => {
+  //   if (!imageSrc) {
+  //     setStatus("Load image first");
+  //     return;
+  //   }
+  //   const imageBlob = dataUrlToBlob(imageSrc);
+  //   if (!imageBlob) {
+  //     setStatus("Unsupported image source for captioning");
+  //     return;
+  //   }
+  //
+  //   setIsCaptioning(true);
+  //   setStatus("Generating Florence caption...");
+  //   try {
+  //     const formData = new FormData();
+  //     formData.append("file", imageBlob, "track_builder_input.png");
+  //     formData.append("task", captionTask.trim() || DEFAULT_FLORENCE_TASK);
+  //
+  //     const response = await fetch(buildApiUrl("/api/images/caption"), {
+  //       method: "POST",
+  //       body: formData
+  //     });
+  //     if (!response.ok) {
+  //       const errorText = await response.text();
+  //       throw new Error(errorText || `HTTP ${response.status}`);
+  //     }
+  //     const payload = (await response.json()) as {
+  //       text?: string;
+  //       task?: string;
+  //     };
+  //     const nextCaption = payload.text?.trim() ?? "";
+  //     if (!nextCaption) {
+  //       setGeneratedCaption("");
+  //       setStatus("Caption response is empty");
+  //       return;
+  //     }
+  //     setGeneratedCaption(nextCaption);
+  //     setStatus(`Caption generated with task ${payload.task ?? captionTask}`);
+  //   } catch (error) {
+  //     const reason = error instanceof Error ? error.message : "unknown error";
+  //     setStatus(
+  //       `Caption failed: ${reason} (check backend on :8000 or set VITE_BACKEND_URL)`
+  //     );
+  //   } finally {
+  //     setIsCaptioning(false);
+  //   }
+  // };
 
   return (
     <div className="app-root">
@@ -1032,9 +1262,7 @@ export default function App(): JSX.Element {
             <div className="status">
               {isRecording
                 ? `Recording... ${currentFrame + 1}/${FRAME_COUNT}`
-                : isRecordingCompleted
-                  ? "Recording complete"
-                  : status}
+                : status}
             </div>
 
             <section className="control-section">
@@ -1053,10 +1281,38 @@ export default function App(): JSX.Element {
                   Export Track Package
                 </button>
               </div>
+              <label className="slider-field">
+                Server Export Directory
+                <input
+                  type="text"
+                  value={serverExportPath}
+                  onChange={(event) => setServerExportPath(event.target.value)}
+                  placeholder="/path/to/root/dir (empty = local only)"
+                />
+              </label>
+              <label className="slider-field">
+                Export Subdirectory Name
+                <input
+                  type="text"
+                  value={serverExportSubDir}
+                  onChange={(event) => setServerExportSubDir(event.target.value)}
+                  placeholder="e.g. scene_001 (empty = auto timestamp)"
+                />
+              </label>
+              <div className="control-row">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={localDownload}
+                    onChange={(event) => setLocalDownload(event.target.checked)}
+                  />
+                  {" "}Also download locally
+                </label>
+              </div>
               <div className="path-info">
                 Image: {image ? `${image.width}x${image.height}` : "None"}
               </div>
-              <label className="slider-field">
+              {/* <label className="slider-field">
                 Florence Task Prompt
                 <input
                   type="text"
@@ -1083,7 +1339,7 @@ export default function App(): JSX.Element {
                   placeholder="Caption will appear here"
                   rows={4}
                 />
-              </label>
+              </label> */}
             </section>
 
             <section className="control-section">
@@ -1103,6 +1359,15 @@ export default function App(): JSX.Element {
                     <option value="square">Square</option>
                     <option value="circle">Circle</option>
                   </select>
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={isStaticPointCloud}
+                    onChange={(event) => handleStaticPointCloudToggle(event.target.checked)}
+                    disabled={isRecording}
+                  />
+                  {" "}New Track Static
                 </label>
                 <label>
                   Rows
@@ -1127,10 +1392,21 @@ export default function App(): JSX.Element {
                   />
                 </label>
               </div>
-              <div className="path-info">Target: {targetPointCount} points</div>
+              <div className="path-info">Target per new track: {targetPointCount} points</div>
               <div className="control-row">
-                <button type="button" onClick={createOrUpdatePointCloudPath} disabled={isRecording}>
-                  Create / Update Point Cloud
+                <button
+                  type="button"
+                  onClick={() => createOrUpdatePointCloudPath(true)}
+                  disabled={isRecording}
+                >
+                  Add Point Cloud Track
+                </button>
+                <button
+                  type="button"
+                  onClick={() => createOrUpdatePointCloudPath(false)}
+                  disabled={!selectedPathId || isRecording}
+                >
+                  Update Selected Track
                 </button>
                 <button
                   type="button"
@@ -1139,7 +1415,41 @@ export default function App(): JSX.Element {
                 >
                   Use Current Pose as Frame 1
                 </button>
+                <button
+                  type="button"
+                  onClick={() => applyStaticPoseToSelectedPath()}
+                  disabled={!selectedPathId || isRecording}
+                >
+                  Make Current Pose Static
+                </button>
+                <button
+                  type="button"
+                  onClick={makeSelectedPathMoving}
+                  disabled={!selectedPathId || isRecording}
+                >
+                  Make Selected Moving
+                </button>
               </div>
+              {paths.length > 0 ? (
+                <div className="track-list">
+                  {paths.map((path, index) => {
+                    const mode = getTrackMode(path);
+                    const pointCount = path.keyframes?.[0]?.length ?? path.points.length;
+                    return (
+                      <button
+                        key={path.id}
+                        type="button"
+                        className={path.id === selectedPathId ? "track-item active" : "track-item"}
+                        onClick={() => setSelectedPathId(path.id)}
+                        disabled={isRecording}
+                      >
+                        <span>{index + 1}. {path.name}</span>
+                        <span>{mode} / {pointCount} pts</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
               <label className="slider-field">
                 Point Spacing Scale: x{pointSpacingScale.toFixed(2)}
                 <input
@@ -1161,16 +1471,15 @@ export default function App(): JSX.Element {
               <button
                 type="button"
                 className={isRecording ? "recording-button recording primary" : "recording-button primary"}
-                onClick={() =>
-                  setIsRecording((prev) => {
-                    const next = !prev;
-                    if (next) {
-                      setIsRecordingCompleted(false);
-                    }
-                    return next;
-                  })
-                }
-                disabled={!selectedPathId}
+                onClick={() => {
+                  if (isRecording) {
+                    handleStopRecording();
+                  } else {
+                    setIsRecordingCompleted(false);
+                    setIsRecording(true);
+                  }
+                }}
+                disabled={!selectedPathId || selectedTrackMode === "static"}
               >
                 {isRecording ? "Recording" : "Recording ON"}
               </button>
@@ -1197,8 +1506,9 @@ export default function App(): JSX.Element {
             </section>
 
             <div className="path-info">
-              Selected: {selectedPath ? selectedPath.name : "None"} (
+              Selected: {selectedPath ? `${selectedPath.name} / ${selectedTrackMode}` : "None"} (
               {selectedDisplayPath?.points.length ?? 0} pts @ frame {currentFrame + 1})
+              {" "}Total: {paths.length} tracks / {totalPointCount} pts
             </div>
           </aside>
 

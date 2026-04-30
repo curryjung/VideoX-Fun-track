@@ -21,6 +21,9 @@ class TrackPath(BaseModel):
     id: str
     name: str
     points: list[Point] = Field(default_factory=list)
+    keyframes: list[list[Point]] | None = None
+    trackMode: Literal["moving", "static"] = "moving"
+    pointMode: str | None = None
     closed: bool = False
     color: str = "#ff5f7a"
 

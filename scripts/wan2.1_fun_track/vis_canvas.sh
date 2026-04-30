@@ -1,0 +1,12 @@
+python scripts/wan2.1_fun_track/visualize_track_canvas.py \
+  --meta_json /data/project-vilab/jaeseok/VideoX-Fun/datasets/internal_datasets/metadata_track_train_kept.json \
+  --data_root /data/shared-vilab/datasets/OpenVid-1M \
+  --meta_offset 0 \
+  --meta_count 8 \
+  --apply_track_normalize \
+  --modes auto normalized \
+  --save_mp4 \
+  --fps 8 \
+  --heat_percentile 99.0 \
+  --heat_gamma 1.4 \
+  --output_dir /data/project-vilab/jaeseok/VideoX-Fun/output_dir_wan2.1_fun_track/track_canvas_debug_quick

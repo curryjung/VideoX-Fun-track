@@ -1,24 +1,75 @@
 #!/usr/bin/env bash
+# Fresh run initialized from checkpoint weights (optimizer/scheduler reset).
+# Stronger caption dropout vs default 0.1.
+
+TRACK_STRENGTH_PRESET_TRACK="${TRACK_STRENGTH_PRESET_TRACK:-aggressive_boundary}"
+case "${TRACK_STRENGTH_PRESET_TRACK}" in
+  baseline)
+    TRACK_PATCH_INIT_MODE_TRACK="${TRACK_PATCH_INIT_MODE_TRACK:-copy_noisy}"
+    TRACK_PATCH_INIT_GAIN_TRACK="${TRACK_PATCH_INIT_GAIN_TRACK:-1.0}"
+    TRACK_LATENT_SCALE_TRACK="${TRACK_LATENT_SCALE_TRACK:-1.0}"
+    ;;
+  aggressive_clean)
+    TRACK_PATCH_INIT_MODE_TRACK="${TRACK_PATCH_INIT_MODE_TRACK:-copy_first}"
+    TRACK_PATCH_INIT_GAIN_TRACK="${TRACK_PATCH_INIT_GAIN_TRACK:-1.0}"
+    TRACK_LATENT_SCALE_TRACK="${TRACK_LATENT_SCALE_TRACK:-4.0}"
+    ;;
+  aggressive_boundary)
+    TRACK_PATCH_INIT_MODE_TRACK="${TRACK_PATCH_INIT_MODE_TRACK:-copy_first}"
+    TRACK_PATCH_INIT_GAIN_TRACK="${TRACK_PATCH_INIT_GAIN_TRACK:-1.0}"
+    TRACK_LATENT_SCALE_TRACK="${TRACK_LATENT_SCALE_TRACK:-8.0}"
+    ;;
+  safer)
+    TRACK_PATCH_INIT_MODE_TRACK="${TRACK_PATCH_INIT_MODE_TRACK:-copy_first}"
+    TRACK_PATCH_INIT_GAIN_TRACK="${TRACK_PATCH_INIT_GAIN_TRACK:-1.0}"
+    TRACK_LATENT_SCALE_TRACK="${TRACK_LATENT_SCALE_TRACK:-2.0}"
+    ;;
+  *)
+    echo "[error] Unknown TRACK_STRENGTH_PRESET_TRACK=${TRACK_STRENGTH_PRESET_TRACK}" >&2
+    echo "[hint] Use one of: baseline, aggressive_clean, safer" >&2
+    exit 1
+    ;;
+esac
+
 GRADIENT_CHECKPOINTING_TRACK=true \
 MIXED_PRECISION_TRACK=bf16 \
 NUM_PROCESSES_TRACK=8 \
 DATASET_NAME_TRACK="/data/shared-vilab/datasets/OpenVid-1M" \
-DATASET_META_NAME_TRACK="/data/project-vilab/jaeseok/VideoX-Fun/datasets/internal_datasets/metadata_track_train.json" \
+DATASET_META_NAME_TRACK="/data/project-vilab/jaeseok/VideoX-Fun/datasets/internal_datasets/metadata_track_fineMotion_bin8_train_78k.json" \
 VAL_DATA_META_NAME_TRACK="/data/project-vilab/jaeseok/VideoX-Fun/datasets/internal_datasets/val_metadata_track.json" \
-CHECKPOINT_DIR_TRACK="/data/project-vilab/jaeseok/VideoX-Fun/checkpoints/wan_track_NEW_PARAMS_ONLY_STEPS_10000" \
+CHECKPOINT_DIR_TRACK="/data/project-vilab/jaeseok/VideoX-Fun/checkpoints/wan_track_patch-${TRACK_PATCH_INIT_MODE_TRACK}_gain-${TRACK_PATCH_INIT_GAIN_TRACK}_scale-${TRACK_LATENT_SCALE_TRACK}_track_local-point-id_bs64_train_78k_h_dim_64_all-dropouts_0p1" \
 CHECKPOINTING_STEPS_TRACK=200 \
 VALIDATION_STEPS_TRACK=200 \
 VALIDATION_MAX_BATCHES_TRACK=4 \
 TRACK_CONDITION_DROP_PROB_TRACK=0.1 \
+FIRST_FRAME_CONDITION_DROP_PROB_TRACK=0.1 \
+TEXT_DROP_RATIO_TRACK=0.1 \
 DEBUG_WEIGHT_UPDATE_TRACK=false \
 DEBUG_WEIGHT_UPDATE_TOPK_TRACK=50 \
-RESUME_FROM_CHECKPOINT_TRACK="/data/project-vilab/jaeseok/VideoX-Fun/checkpoints/wan_track_NEW_PARAMS_ONLY_STEPS_10000/checkpoint-2000" \
-NEW_PARAMS_ONLY_STEPS_TRACK=10000 \
-LEARNING_RATE_TRACK=5e-4 \
-LR_WARMUP_STEPS_TRACK=800 \
+TRACK_DEBUG_VIS_STEPS_TRACK=200 \
+TRACK_DEBUG_VIS_DIR_TRACK="track_debug_vis_dense" \
+TRACK_DEBUG_VIS_SAMPLE_INDEX_TRACK=0 \
+TRACK_DEBUG_VIS_MAX_FRAMES_TRACK=-1 \
+TRACK_DEBUG_VIS_MAX_POINTS_TRACK=1024 \
+TRACK_DEBUG_VIS_FPS_TRACK=16 \
+NUM_TRAIN_EPOCHS_TRACK=1000 \
+APPLY_TRACK_PATCH_EMBED_INIT_TRACK=true \
+TRACK_PATCH_INIT_MODE_TRACK="${TRACK_PATCH_INIT_MODE_TRACK}" \
+TRACK_PATCH_INIT_GAIN_TRACK="${TRACK_PATCH_INIT_GAIN_TRACK}" \
+TRACK_LATENT_SCALE_TRACK="${TRACK_LATENT_SCALE_TRACK}" \
+ADD_TRACK_INIT_NOISE_TRACK=true \
+TRACK_INIT_NOISE_SCALE_TRACK=0.01 \
+TRACK_HEAD_HIDDEN_DIM_TRACK=64 \
+TRAIN_BATCH_SIZE_TRACK=8 \
+NEW_PARAMS_ONLY_STEPS_TRACK=0 \
+LEARNING_RATE_TRACK=1e-5 \
+ADAM_WEIGHT_DECAY_TRACK=0 \
+ADAM_EPSILON_TRACK=1e-8 \
+NEW_TRACK_LAYERS_LR_TRACK=1e-5 \
+EARLY_BLOCKS_LR_TRACK=1e-5 \
+TRAIN_EARLY_BLOCKS_TRACK=-1 \
+LR_WARMUP_STEPS_TRACK=10 \
+TRACK_SORT_SELECTED_INDICES_TRACK=false \
+TRACK_POINT_ID_MODE_TRACK=local \
+PRECOMPUTED_UNCOND_TEXT_NPZ_TRACK="/data/project-vilab/jaeseok/VideoX-Fun/asset/t5_uncond_empty_prompt.npz" \
 bash scripts/wan2.1_fun_track/train_track.sh
-
-
-
-# RESUME_FROM_CHECKPOINT_TRACK="/data/project-vilab/jaeseok/VideoX-Fun/output_dir_wan2.1_fun_track/checkpoint-1750" \
-# DATASET_NAME_TRACK="/data/shared-vilab/datasets/OpenVid-1M/out_preprocess_openvid_cotracker_preshard_20260402_134900" \

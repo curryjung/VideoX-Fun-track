@@ -82,6 +82,27 @@ body {
   flex-wrap: wrap;
 }
 
+.track-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 190px;
+  overflow: auto;
+}
+
+.track-item {
+  width: 100%;
+  justify-content: space-between;
+  text-align: left;
+  display: flex;
+  gap: 10px;
+}
+
+.track-item.active {
+  border-color: #00d7ff;
+  background: #123044;
+}
+
 .slider-field {
   display: flex;
   flex-direction: column;

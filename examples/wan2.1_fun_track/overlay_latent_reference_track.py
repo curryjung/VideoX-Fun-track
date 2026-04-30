@@ -1,8 +1,10 @@
 import argparse
+import csv
+import json
 import os
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import imageio
 import numpy as np
@@ -32,6 +34,93 @@ def _resolve_track_npz(sample_dir: Path, track_npz_path: str) -> Path:
     if not candidates:
         raise FileNotFoundError(f"No npz found under sample dir: {sample_dir}")
     return candidates[0]
+
+
+def _read_metadata_records(metadata_path: Path) -> List[Dict]:
+    suffix = metadata_path.suffix.lower()
+    if suffix == ".json":
+        with metadata_path.open("r", encoding="utf-8") as f:
+            rows = json.load(f)
+        if not isinstance(rows, list):
+            raise ValueError(f"JSON metadata must be a list: {metadata_path}")
+        return rows
+
+    if suffix == ".jsonl":
+        rows: List[Dict] = []
+        with metadata_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append(json.loads(line))
+        return rows
+
+    if suffix == ".csv":
+        with metadata_path.open("r", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    raise ValueError(f"Unsupported metadata format: {metadata_path}")
+
+
+def _resolve_relative_path(path_value: str, search_roots: Sequence[Path]) -> Path:
+    candidate = Path(path_value).expanduser()
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"Path does not exist: {resolved}")
+        return resolved
+
+    attempts: List[Path] = []
+    for root in search_roots:
+        merged = (root / candidate).resolve()
+        attempts.append(merged)
+        if merged.exists():
+            return merged
+
+    attempt_text = "\n".join(f"  - {p}" for p in attempts)
+    raise FileNotFoundError(
+        f"Could not resolve relative path: {path_value}\n"
+        f"Tried:\n{attempt_text}"
+    )
+
+
+def _resolve_sample_from_metadata(
+    metadata_path: Path,
+    sample_index: int,
+    metadata_data_root: str,
+    metadata_track_key: str,
+    metadata_latent_key: str,
+) -> Tuple[Path, Path, Dict, int]:
+    rows = _read_metadata_records(metadata_path)
+    if not rows:
+        raise ValueError(f"Metadata is empty: {metadata_path}")
+
+    idx = int(sample_index)
+    if idx < 0:
+        idx += len(rows)
+    if idx < 0 or idx >= len(rows):
+        raise IndexError(f"sample_index={sample_index} out of range for len={len(rows)}")
+
+    row = rows[idx]
+    if not isinstance(row, dict):
+        raise ValueError(f"Metadata row must be dict at index {idx}: {type(row).__name__}")
+
+    track_value = row.get(metadata_track_key, "")
+    if not track_value:
+        raise KeyError(f"Missing `{metadata_track_key}` in metadata row {idx}")
+    latent_value = row.get(metadata_latent_key, row.get("file_path", ""))
+    if not latent_value:
+        raise KeyError(
+            f"Missing `{metadata_latent_key}` (or fallback `file_path`) in metadata row {idx}"
+        )
+
+    search_roots = [metadata_path.parent, Path.cwd()]
+    if metadata_data_root:
+        search_roots.insert(0, Path(metadata_data_root).expanduser().resolve())
+
+    track_path = _resolve_relative_path(str(track_value), search_roots)
+    latents_path = _resolve_relative_path(str(latent_value), search_roots)
+    return latents_path, track_path, row, idx
 
 
 def _load_tracks(track_npz: Path) -> Tuple[np.ndarray, np.ndarray]:
@@ -158,7 +247,41 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Overlay transformed tracks on decoded reference video from VAE latents."
     )
-    parser.add_argument("--sample_dir", type=str, required=True)
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--sample_dir", type=str, default="")
+    source_group.add_argument(
+        "--metadata_path",
+        type=str,
+        default="",
+        help="Path to json/jsonl/csv metadata containing latent + track paths.",
+    )
+    parser.add_argument(
+        "--sample_index",
+        type=int,
+        default=0,
+        help="Row index for --metadata_path mode. Negative index is supported.",
+    )
+    parser.add_argument(
+        "--metadata_data_root",
+        type=str,
+        default="",
+        help=(
+            "Optional root to prepend to relative metadata paths. "
+            "Useful when metadata paths are rooted outside this repo."
+        ),
+    )
+    parser.add_argument(
+        "--metadata_track_key",
+        type=str,
+        default="track_file_path",
+        help="Track path key in metadata rows.",
+    )
+    parser.add_argument(
+        "--metadata_latent_key",
+        type=str,
+        default="latent_file_path",
+        help="Latent path key in metadata rows (fallback: file_path).",
+    )
     parser.add_argument("--latents_path", type=str, default="")
     parser.add_argument("--track_npz_path", type=str, default="")
     parser.add_argument(
@@ -215,19 +338,59 @@ def main() -> None:
         sys.path.insert(0, cotracker_root_str)
     from cotracker.utils.visualizer import Visualizer
 
-    sample_dir = Path(args.sample_dir).expanduser().resolve()
-    if not sample_dir.exists():
-        raise FileNotFoundError(f"Sample dir not found: {sample_dir}")
+    metadata_row: Optional[Dict] = None
+    metadata_idx: Optional[int] = None
+    if args.metadata_path:
+        metadata_path = Path(args.metadata_path).expanduser().resolve()
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata path not found: {metadata_path}")
+        latents_from_meta, track_from_meta, metadata_row, metadata_idx = _resolve_sample_from_metadata(
+            metadata_path=metadata_path,
+            sample_index=int(args.sample_index),
+            metadata_data_root=str(args.metadata_data_root),
+            metadata_track_key=str(args.metadata_track_key),
+            metadata_latent_key=str(args.metadata_latent_key),
+        )
+        sample_dir = latents_from_meta.parent
+        latents_path = (
+            Path(args.latents_path).expanduser().resolve()
+            if args.latents_path
+            else latents_from_meta
+        )
+        track_npz = (
+            Path(args.track_npz_path).expanduser().resolve()
+            if args.track_npz_path
+            else track_from_meta
+        )
+    else:
+        sample_dir = Path(args.sample_dir).expanduser().resolve()
+        if not sample_dir.exists():
+            raise FileNotFoundError(f"Sample dir not found: {sample_dir}")
+        latents_path = (
+            Path(args.latents_path).expanduser().resolve()
+            if args.latents_path
+            else (sample_dir / "vae_latents.pt")
+        )
+        track_npz = _resolve_track_npz(sample_dir=sample_dir, track_npz_path=args.track_npz_path)
 
-    latents_path = (
-        Path(args.latents_path).expanduser().resolve()
-        if args.latents_path
-        else (sample_dir / "vae_latents.pt")
-    )
     if not latents_path.exists():
         raise FileNotFoundError(f"Latents not found: {latents_path}")
+    if not track_npz.exists():
+        raise FileNotFoundError(f"Track npz not found: {track_npz}")
 
-    track_npz = _resolve_track_npz(sample_dir=sample_dir, track_npz_path=args.track_npz_path)
+    if metadata_row is not None and metadata_idx is not None:
+        print(
+            "[info] metadata selection "
+            f"index={metadata_idx} "
+            f"text_head={str(metadata_row.get('text', ''))[:80]!r}"
+        )
+        print(
+            "[info] metadata paths "
+            f"track={metadata_row.get(args.metadata_track_key, '')} "
+            f"latent={metadata_row.get(args.metadata_latent_key, metadata_row.get('file_path', ''))}"
+        )
+        print(f"[info] resolved paths track={track_npz} latent={latents_path}")
+
     tracks, visibility = _load_tracks(track_npz)
 
     if not torch.cuda.is_available():

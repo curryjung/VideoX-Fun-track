@@ -44,6 +44,7 @@ export TRACK_MAX_POINTS_TRACK="${TRACK_MAX_POINTS_TRACK:--1}"
 export TRACK_RANDOM_POINTS_MIN_TRACK="${TRACK_RANDOM_POINTS_MIN_TRACK:-1000}"
 export TRACK_RANDOM_POINTS_MAX_TRACK="${TRACK_RANDOM_POINTS_MAX_TRACK:-2500}"
 export TRACK_CONDITION_DROP_PROB_TRACK="${TRACK_CONDITION_DROP_PROB_TRACK:-0.0}"
+export FIRST_FRAME_CONDITION_DROP_PROB_TRACK="${FIRST_FRAME_CONDITION_DROP_PROB_TRACK:-0.0}"
 export VAL_DATA_META_NAME_TRACK="${VAL_DATA_META_NAME_TRACK:-}"
 export VAL_DATASET_NAME_TRACK="${VAL_DATASET_NAME_TRACK:-}"
 export VALIDATION_STEPS_TRACK="${VALIDATION_STEPS_TRACK:-0}"
@@ -53,6 +54,9 @@ export DEBUG_WEIGHT_UPDATE_TRACK="${DEBUG_WEIGHT_UPDATE_TRACK:-false}"
 export DEBUG_WEIGHT_UPDATE_TOPK_TRACK="${DEBUG_WEIGHT_UPDATE_TOPK_TRACK:-30}"
 export CHECKPOINTING_STEPS_TRACK="${CHECKPOINTING_STEPS_TRACK:-500}"
 export LEARNING_RATE_TRACK="${LEARNING_RATE_TRACK:-1e-5}"
+export NEW_TRACK_LAYERS_LR_TRACK="${NEW_TRACK_LAYERS_LR_TRACK:-${LEARNING_RATE_TRACK}}"
+export EARLY_BLOCKS_LR_TRACK="${EARLY_BLOCKS_LR_TRACK:-${LEARNING_RATE_TRACK}}"
+export TRAIN_EARLY_BLOCKS_TRACK="${TRAIN_EARLY_BLOCKS_TRACK:--1}"
 export LR_WARMUP_STEPS_TRACK="${LR_WARMUP_STEPS_TRACK:-800}"
 export USE_FIRST_FRAME_CONDITION_TRACK="${USE_FIRST_FRAME_CONDITION_TRACK:-true}"
 
@@ -123,12 +127,16 @@ fi
   echo "mixed_precision=${MIXED_PRECISION_TRACK}"
   echo "checkpointing_steps=${CHECKPOINTING_STEPS_TRACK}"
   echo "learning_rate=${LEARNING_RATE_TRACK}"
+  echo "new_track_layers_lr=${NEW_TRACK_LAYERS_LR_TRACK}"
+  echo "early_blocks_lr=${EARLY_BLOCKS_LR_TRACK}"
+  echo "train_early_blocks=${TRAIN_EARLY_BLOCKS_TRACK}"
   echo "lr_warmup_steps=${LR_WARMUP_STEPS_TRACK}"
   echo "init_model_from_checkpoint=${INIT_MODEL_FROM_CHECKPOINT_TRACK}"
   echo "track_max_points=${TRACK_MAX_POINTS_TRACK}"
   echo "track_random_points_min=${TRACK_RANDOM_POINTS_MIN_TRACK}"
   echo "track_random_points_max=${TRACK_RANDOM_POINTS_MAX_TRACK}"
   echo "track_condition_drop_prob=${TRACK_CONDITION_DROP_PROB_TRACK}"
+  echo "first_frame_condition_drop_prob=${FIRST_FRAME_CONDITION_DROP_PROB_TRACK}"
   echo "validation_steps=${VALIDATION_STEPS_TRACK}"
   echo "validation_max_batches=${VALIDATION_MAX_BATCHES_TRACK}"
   echo "val_data_meta=${VAL_DATA_META_NAME_TRACK}"
@@ -193,6 +201,9 @@ fi
   --validation_steps_track="${VALIDATION_STEPS_TRACK}" \
   --validation_max_batches_track="${VALIDATION_MAX_BATCHES_TRACK}" \
   --learning_rate="${LEARNING_RATE_TRACK}" \
+  --new_track_layers_lr="${NEW_TRACK_LAYERS_LR_TRACK}" \
+  --early_blocks_lr="${EARLY_BLOCKS_LR_TRACK}" \
+  --train_early_blocks_track="${TRAIN_EARLY_BLOCKS_TRACK}" \
   --lr_scheduler="constant_with_warmup" \
   --lr_warmup_steps="${LR_WARMUP_STEPS_TRACK}" \
   --seed=42 \
@@ -211,5 +222,6 @@ fi
   --track_random_points_min="${TRACK_RANDOM_POINTS_MIN_TRACK}" \
   --track_random_points_max="${TRACK_RANDOM_POINTS_MAX_TRACK}" \
   --track_condition_drop_prob="${TRACK_CONDITION_DROP_PROB_TRACK}" \
+  --first_frame_condition_drop_prob_track="${FIRST_FRAME_CONDITION_DROP_PROB_TRACK}" \
   --track_normalize \
   "${EXTRA_ARGS_TRACK[@]}"

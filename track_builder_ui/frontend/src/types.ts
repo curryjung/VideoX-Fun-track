@@ -38,3 +38,39 @@ export type TrackDocument = {
 };
 
 export type EditorTool = "pointCloudEdit";
+
+export type GenerationMode = "motion_only" | "text_only" | "joint_tm";
+
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "done"
+  | "failed"
+  | "canceled"
+  | "interrupted";
+
+export type JobRecord = {
+  job_id: string;
+  status: JobStatus;
+  mode: GenerationMode;
+  prompt: string;
+  seed: number;
+  text_guidance_weight: number;
+  motion_guidance_weight: number;
+  created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  input: {
+    image: string;
+    tracks: string;
+    preview?: string | null;
+  };
+  outputs: {
+    video?: string | null;
+    overlay_video?: string | null;
+  };
+  log_path: string;
+  error_message?: string | null;
+  return_code?: number | null;
+  source_job_id?: string | null;
+};

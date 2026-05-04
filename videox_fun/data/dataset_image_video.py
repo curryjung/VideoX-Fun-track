@@ -92,13 +92,19 @@ class ImageVideoDataset(Dataset):
         enable_inpaint=False,
         return_file_name=False,
     ):
-        # Loading annotations from files
-        print(f"loading annotations from {ann_path} ...")
-        if ann_path.endswith('.csv'):
+        # Loading annotations from files, or an already-loaded in-memory list.
+        if isinstance(ann_path, list):
+            print(f"loading annotations from in-memory list ({len(ann_path)} records) ...")
+            dataset = ann_path
+        else:
+            print(f"loading annotations from {ann_path} ...")
+        if isinstance(ann_path, str) and ann_path.endswith('.csv'):
             with open(ann_path, 'r') as csvfile:
                 dataset = list(csv.DictReader(csvfile))
-        elif ann_path.endswith('.json'):
+        elif isinstance(ann_path, str) and ann_path.endswith('.json'):
             dataset = json.load(open(ann_path))
+        elif not isinstance(ann_path, list):
+            raise ValueError(f"Unsupported annotation source: {ann_path}")
     
         self.data_root = data_root
 
@@ -151,16 +157,21 @@ class ImageVideoDataset(Dataset):
 
         self.larger_side_of_image_and_video = max(min(self.image_sample_size), min(self.video_sample_size))
 
+    def _resolve_data_path(self, data_path, data_info=None):
+        del data_info
+        if os.path.isabs(data_path):
+            return data_path
+        if self.data_root is None:
+            return data_path
+        return os.path.join(self.data_root, data_path)
+
     def get_batch(self, idx):
         data_info = self.dataset[idx % len(self.dataset)]
         
         if data_info.get('type', 'image')=='video':
             video_id, text = data_info['file_path'], data_info['text']
 
-            if self.data_root is None:
-                video_dir = video_id
-            else:
-                video_dir = os.path.join(self.data_root, video_id)
+            video_dir = self._resolve_data_path(video_id, data_info=data_info)
 
             with VideoReader_contextmanager(video_dir, num_threads=2) as video_reader:
                 min_sample_n_frames = min(
@@ -207,8 +218,7 @@ class ImageVideoDataset(Dataset):
             return pixel_values, text, 'video', video_dir
         else:
             image_path, text = data_info['file_path'], data_info['text']
-            if self.data_root is not None:
-                image_path = os.path.join(self.data_root, image_path)
+            image_path = self._resolve_data_path(image_path, data_info=data_info)
             image = Image.open(image_path).convert('RGB')
             if not self.enable_bucket:
                 image = self.image_transforms(image).unsqueeze(0)

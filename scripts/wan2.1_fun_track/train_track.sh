@@ -23,6 +23,7 @@ fi
 export MODEL_NAME_TRACK="${MODEL_NAME_TRACK:-models/Diffusion_Transformer/Wan2.1-Fun-V1.1-1.3B-InP}"
 export DATASET_NAME_TRACK="${DATASET_NAME_TRACK:-datasets/internal_datasets/}"
 export DATASET_META_NAME_TRACK="${DATASET_META_NAME_TRACK:-datasets/internal_datasets/metadata_track.json}"
+export DATASET_SPECS_TRACK="${DATASET_SPECS_TRACK:-}"
 export INPUT_MODE_TRACK="${INPUT_MODE_TRACK:-latent}"
 export DATASET_ROOT_MAP_JSON_TRACK="${DATASET_ROOT_MAP_JSON_TRACK:-}"
 export DATASET_ROOT_ID_KEY_TRACK="${DATASET_ROOT_ID_KEY_TRACK:-root_id}"
@@ -37,6 +38,8 @@ export APPLY_TRACK_PATCH_EMBED_INIT_TRACK="${APPLY_TRACK_PATCH_EMBED_INIT_TRACK:
 export TRACK_PATCH_INIT_MODE_TRACK="${TRACK_PATCH_INIT_MODE_TRACK:-copy_noisy}"
 export TRACK_PATCH_INIT_GAIN_TRACK="${TRACK_PATCH_INIT_GAIN_TRACK:-1.0}"
 export TRACK_LATENT_SCALE_TRACK="${TRACK_LATENT_SCALE_TRACK:-1.0}"
+export TRACK_LATENT_FIRST_FRAME_SCALE_TRACK="${TRACK_LATENT_FIRST_FRAME_SCALE_TRACK:-${TRACK_LATENT_FIRST_FRAME_SCALE:-}}"
+export TRACK_LATENT_REST_FRAME_SCALE_TRACK="${TRACK_LATENT_REST_FRAME_SCALE_TRACK:-${TRACK_LATENT_REST_FRAME_SCALE:-}}"
 export ADD_TRACK_INIT_NOISE_TRACK="${ADD_TRACK_INIT_NOISE_TRACK:-false}"
 export TRACK_INIT_NOISE_SCALE_TRACK="${TRACK_INIT_NOISE_SCALE_TRACK:-0.01}"
 export TRACK_HEAD_HIDDEN_DIM_TRACK="${TRACK_HEAD_HIDDEN_DIM_TRACK:-}"
@@ -85,7 +88,12 @@ export INIT_MODEL_FROM_CHECKPOINT_TRACK="${INIT_MODEL_FROM_CHECKPOINT_TRACK:-}"
 # Optional: npz from scripts/wan2.1_fun_track/precompute_uncond_text_track.py (caption-drop rows in latent mode).
 export PRECOMPUTED_UNCOND_TEXT_NPZ_TRACK="${PRECOMPUTED_UNCOND_TEXT_NPZ_TRACK:-}"
 
-if [[ ! -f "${DATASET_META_NAME_TRACK}" ]]; then
+if [[ -n "${DATASET_SPECS_TRACK}" && ! -f "${DATASET_SPECS_TRACK}" ]]; then
+  echo "[error] Dataset specs file not found: ${DATASET_SPECS_TRACK}"
+  exit 1
+fi
+
+if [[ -z "${DATASET_SPECS_TRACK}" && ! -f "${DATASET_META_NAME_TRACK}" ]]; then
   echo "[error] Metadata file not found: ${DATASET_META_NAME_TRACK}"
   echo "[hint] Build it first with:"
   echo "  python scripts/wan2.1_fun_track/build_metadata_track.py --help"
@@ -95,6 +103,11 @@ fi
 EXTRA_ARGS_TRACK=()
 if [[ -n "${DATASET_ROOT_MAP_JSON_TRACK}" ]]; then
   EXTRA_ARGS_TRACK+=("--train_data_root_map_json_track=${DATASET_ROOT_MAP_JSON_TRACK}")
+fi
+if [[ -n "${DATASET_SPECS_TRACK}" ]]; then
+  EXTRA_ARGS_TRACK+=("--train_dataset_specs_track=${DATASET_SPECS_TRACK}")
+fi
+if [[ -n "${DATASET_ROOT_MAP_JSON_TRACK}" || -n "${DATASET_SPECS_TRACK}" ]]; then
   EXTRA_ARGS_TRACK+=("--train_data_root_id_key_track=${DATASET_ROOT_ID_KEY_TRACK}")
 fi
 if [[ -n "${WANDB_RUN_NAME_TRACK}" ]]; then
@@ -108,6 +121,12 @@ if [[ -n "${RESUME_FROM_CHECKPOINT_TRACK}" ]]; then
 fi
 if [[ -n "${INIT_MODEL_FROM_CHECKPOINT_TRACK}" ]]; then
   EXTRA_ARGS_TRACK+=("--init_model_from_checkpoint_track=${INIT_MODEL_FROM_CHECKPOINT_TRACK}")
+fi
+if [[ -n "${TRACK_LATENT_FIRST_FRAME_SCALE_TRACK}" ]]; then
+  EXTRA_ARGS_TRACK+=("--track_latent_first_frame_scale=${TRACK_LATENT_FIRST_FRAME_SCALE_TRACK}")
+fi
+if [[ -n "${TRACK_LATENT_REST_FRAME_SCALE_TRACK}" ]]; then
+  EXTRA_ARGS_TRACK+=("--track_latent_rest_frame_scale=${TRACK_LATENT_REST_FRAME_SCALE_TRACK}")
 fi
 if [[ -n "${VAL_DATA_META_NAME_TRACK}" ]]; then
   EXTRA_ARGS_TRACK+=("--val_data_meta_track=${VAL_DATA_META_NAME_TRACK}")
@@ -149,6 +168,9 @@ fi
   echo "checkpoint_root=${CHECKPOINT_ROOT_TRACK}"
   echo "model=${MODEL_NAME_TRACK}"
   echo "meta=${DATASET_META_NAME_TRACK}"
+  echo "dataset_specs=${DATASET_SPECS_TRACK}"
+  echo "dataset_root=${DATASET_NAME_TRACK}"
+  echo "dataset_root_id_key=${DATASET_ROOT_ID_KEY_TRACK}"
   echo "input_mode=${INPUT_MODE_TRACK}"
   echo "num_processes=${NUM_PROCESSES_TRACK}"
   echo "mixed_precision=${MIXED_PRECISION_TRACK}"
@@ -174,6 +196,8 @@ fi
   echo "track_patch_init_mode=${TRACK_PATCH_INIT_MODE_TRACK}"
   echo "track_patch_init_gain=${TRACK_PATCH_INIT_GAIN_TRACK}"
   echo "track_latent_scale=${TRACK_LATENT_SCALE_TRACK}"
+  echo "track_latent_first_frame_scale=${TRACK_LATENT_FIRST_FRAME_SCALE_TRACK:-<track_latent_scale>}"
+  echo "track_latent_rest_frame_scale=${TRACK_LATENT_REST_FRAME_SCALE_TRACK:-<track_latent_scale>}"
   echo "add_track_init_noise=${ADD_TRACK_INIT_NOISE_TRACK}"
   echo "track_init_noise_scale=${TRACK_INIT_NOISE_SCALE_TRACK}"
   echo "track_head_hidden_dim=${TRACK_HEAD_HIDDEN_DIM_TRACK}"

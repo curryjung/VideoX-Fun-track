@@ -1,15 +1,17 @@
 import io
+import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
-from transformers import AutoModelForCausalLM, AutoProcessor
 
+from .job_runner import JobRunner
+from .job_store import JobStore
 from .schemas import (
     ImageCaptionResponse,
     SaveTrackRequest,
@@ -18,15 +20,25 @@ from .schemas import (
 )
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+REPO_ROOT = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
 TRACK_DIR = DATA_DIR / "tracks"
 IMAGE_DIR = DATA_DIR / "images"
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
+JOBS_ROOT = Path(
+    os.environ.get(
+        "TRACK_BUILDER_JOBS_ROOT",
+        str(REPO_ROOT / "asset" / "track_builder_jobs"),
+    )
+)
 
 TRACK_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Track Builder UI API", version="0.1.0")
+job_store = JobStore(JOBS_ROOT)
+job_runner = JobRunner(job_store, REPO_ROOT)
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,14 +53,39 @@ app.mount("/static/images", StaticFiles(directory=str(IMAGE_DIR)), name="images"
 FLORENCE_MODEL_NAME = "microsoft/Florence-2-base"
 DEFAULT_FLORENCE_TASK = "<MORE_DETAILED_CAPTION>"
 
-_caption_model: AutoModelForCausalLM | None = None
-_caption_processor: AutoProcessor | None = None
+_caption_model: Any | None = None
+_caption_processor: Any | None = None
 _caption_device: str | None = None
-_caption_dtype: torch.dtype | None = None
+_caption_dtype: Any | None = None
 
 
-def _get_florence_runtime() -> tuple[AutoModelForCausalLM, AutoProcessor, str, torch.dtype]:
+@app.on_event("startup")
+def start_job_runner() -> None:
+    job_runner.start()
+
+
+def _normalize_generation_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower().replace("-", "_")
+    if normalized == "joint":
+        normalized = "joint_tm"
+    if normalized not in {"motion_only", "text_only", "joint_tm"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported generation mode: {mode}")
+    return normalized
+
+
+def _default_guidance_weights(mode: str) -> tuple[float, float]:
+    if mode == "text_only":
+        return 3.0, 0.0
+    if mode == "joint_tm":
+        return 3.0, 1.5
+    return 0.0, 3.0
+
+
+def _get_florence_runtime() -> tuple[Any, Any, str, Any]:
     global _caption_model, _caption_processor, _caption_device, _caption_dtype
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoProcessor
 
     if _caption_model is not None and _caption_processor is not None:
         return _caption_model, _caption_processor, _caption_device or "cpu", _caption_dtype or torch.float32
@@ -170,6 +207,105 @@ async def export_package(
             saved["preview"] = str(preview_path)
 
     return {"status": "ok", "directory": str(target_dir), "saved": saved}
+
+
+@app.post("/api/jobs")
+async def create_generation_job(
+    image: UploadFile = File(...),
+    tracks_npz: UploadFile = File(...),
+    preview_png: UploadFile | None = File(default=None),
+    mode: str = Form("motion_only"),
+    prompt: str = Form("a video"),
+    seed: int = Form(42),
+    text_guidance_weight: float | None = Form(default=None),
+    motion_guidance_weight: float | None = Form(default=None),
+) -> dict:
+    normalized_mode = _normalize_generation_mode(mode)
+    default_text_weight, default_motion_weight = _default_guidance_weights(normalized_mode)
+    image_bytes = await image.read()
+    tracks_bytes = await tracks_npz.read()
+    preview_bytes = await preview_png.read() if preview_png is not None else None
+    if preview_bytes == b"":
+        preview_bytes = None
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty first-frame image")
+    if not tracks_bytes:
+        raise HTTPException(status_code=400, detail="Empty track npz")
+
+    job = job_store.create_job(
+        image_bytes=image_bytes,
+        tracks_bytes=tracks_bytes,
+        preview_bytes=preview_bytes,
+        mode=normalized_mode,
+        prompt=prompt,
+        seed=seed,
+        text_guidance_weight=(
+            default_text_weight if text_guidance_weight is None else text_guidance_weight
+        ),
+        motion_guidance_weight=(
+            default_motion_weight if motion_guidance_weight is None else motion_guidance_weight
+        ),
+    )
+    job_runner.notify()
+    return {"job": job}
+
+
+@app.get("/api/jobs")
+def list_generation_jobs() -> dict:
+    return {"jobs": job_store.list_jobs()}
+
+
+@app.get("/api/archive")
+def list_archive_jobs() -> dict:
+    return {"jobs": job_store.list_archive_jobs()}
+
+
+@app.get("/api/jobs/{job_id}")
+def read_generation_job(job_id: str) -> dict:
+    try:
+        return {"job": job_store.read_job(job_id)}
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Job not found") from error
+
+
+@app.get("/api/jobs/{job_id}/log")
+def read_generation_job_log(job_id: str) -> dict:
+    try:
+        text = job_store.read_log_tail(job_id)
+    except FileNotFoundError:
+        text = ""
+    return {"job_id": job_id, "text": text}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_generation_job(job_id: str) -> dict:
+    try:
+        job = job_runner.cancel(job_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Job not found") from error
+    return {"job": job}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_generation_job(job_id: str) -> dict:
+    try:
+        job = job_store.retry_job(job_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    job_runner.notify()
+    return {"job": job}
+
+
+@app.get("/api/jobs/{job_id}/file/{file_path:path}")
+def read_generation_job_file(job_id: str, file_path: str) -> FileResponse:
+    try:
+        path = job_store.resolve_job_file(job_id, file_path)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Job file not found") from error
+    return FileResponse(path)
 
 
 @app.post("/api/images/caption", response_model=ImageCaptionResponse)

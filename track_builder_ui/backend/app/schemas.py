@@ -61,3 +61,47 @@ class ImageCaptionResponse(BaseModel):
     task: str
     text: str
     raw_output: dict | list | str | None = None
+
+
+JobStatus = Literal[
+    "queued",
+    "running",
+    "done",
+    "failed",
+    "canceled",
+    "interrupted",
+]
+
+GenerationMode = Literal["motion_only", "text_only", "joint_tm"]
+
+
+class JobInputPaths(BaseModel):
+    image: str
+    tracks: str
+    preview: str | None = None
+
+
+class JobOutputPaths(BaseModel):
+    video: str | None = None
+    overlay_video: str | None = None
+
+
+class JobRecord(BaseModel):
+    job_id: str
+    status: JobStatus
+    mode: GenerationMode = "motion_only"
+    prompt: str = "a video"
+    seed: int = 42
+    text_guidance_weight: float = 0.0
+    motion_guidance_weight: float = 3.0
+    track_latent_first_frame_scale: float = 1.0
+    track_latent_rest_frame_scale: float = 4.0
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    input: JobInputPaths
+    outputs: JobOutputPaths = Field(default_factory=JobOutputPaths)
+    log_path: str = "logs/run.log"
+    error_message: str | None = None
+    return_code: int | None = None
+    source_job_id: str | None = None

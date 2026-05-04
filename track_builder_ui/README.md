@@ -40,19 +40,72 @@ npm run build
 
 ## 2) Backend 실행 (선택)
 
-프론트 단독 실행도 가능하지만, API 저장/로드를 사용하려면 백엔드를 함께 실행하세요.
+프론트 단독 실행도 가능하지만, 서버 export, queue/archive, video generation을 사용하려면 백엔드를 함께 실행하세요.
 
 ```bash
-#install unicorn
-sudo apt install -y unicorn
 cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 - API 문서: `http://127.0.0.1:8000/docs`
+
+## 3) Generation 실행 모드
+
+### Simple mode: backend가 job마다 추론 subprocess 실행
+
+가장 단순한 모드입니다. Frontend + Backend만 실행하면 됩니다. 단, job마다 모델을 다시 GPU에 로드합니다.
+
+```bash
+cd /data/project-vilab/jaeseok/VideoX-Fun/track_builder_ui/backend
+source .venv/bin/activate
+
+TRACK_BUILDER_PYTHON_BIN=/usr/local/bin/python \
+TRACK_BUILDER_CUDA_VISIBLE_DEVICES=6 \
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### Persistent worker mode: 모델을 GPU에 계속 유지
+
+Backend는 job 생성/조회만 담당하고, 별도 worker가 queue를 처리합니다. 생성 작업을 많이 할 때 권장합니다.
+
+터미널 1 - Backend:
+
+```bash
+cd /data/project-vilab/jaeseok/VideoX-Fun/track_builder_ui/backend
+source .venv/bin/activate
+
+TRACK_BUILDER_RUNNER_MODE=external \
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+터미널 2 - Persistent worker:
+
+```bash
+cd /data/project-vilab/jaeseok/VideoX-Fun
+
+CUDA_VISIBLE_DEVICES=6 \
+python examples/wan2.1_fun_track/run_track_i2v_worker_experimental.py
+```
+
+터미널 3 - Frontend:
+
+```bash
+cd /data/project-vilab/jaeseok/VideoX-Fun/track_builder_ui/frontend
+npm run dev -- --host 0.0.0.0 --port 5173
+```
+
+> `run_track_i2v_worker_experimental.py`는 기존 `predict_i2v_track.py`를 수정하지 않고 helper를 import해서 사용하는 실험용 persistent worker입니다.
+
+### Generation 환경변수
+
+- `TRACK_BUILDER_CUDA_VISIBLE_DEVICES`: simple mode에서 backend subprocess가 사용할 GPU index. 기본값은 `6`.
+- `CUDA_VISIBLE_DEVICES`: persistent worker가 사용할 GPU index.
+- `TRACK_BUILDER_PYTHON_BIN`: simple mode에서 추론 subprocess에 사용할 Python.
+- `TRACK_BUILDER_TRANSFORMER_CHECKPOINT_PATH`: 사용할 checkpoint 경로를 직접 지정.
+- `TRACK_BUILDER_JOBS_ROOT`: job/archive 저장 루트. 기본값은 `asset/track_builder_jobs`.
 
 ## 빠른 사용 순서
 
@@ -79,3 +132,5 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - 의존성 꼬임 시:
   - frontend: `rm -rf node_modules package-lock.json && npm install`
   - backend: 가상환경 삭제 후 재생성
+- `transformers` import에서 `huggingface-hub` 버전 에러가 나면 generation에 사용하는 Python 환경의 버전을 맞추세요:
+  - `python -m pip install "huggingface-hub>=0.26.0,<1.0"`

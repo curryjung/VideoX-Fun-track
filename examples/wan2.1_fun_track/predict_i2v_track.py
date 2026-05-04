@@ -474,51 +474,64 @@ def _overlay_tracks_on_video(
         tracks[..., 0] *= float(max(width - 1, 1))
         tracks[..., 1] *= float(max(height - 1, 1))
     else:
-        x_max = float(np.nanmax(tracks[..., 0])) if tracks.size else 1.0
-        x_min = float(np.nanmin(tracks[..., 0])) if tracks.size else 0.0
-        y_max = float(np.nanmax(tracks[..., 1])) if tracks.size else 1.0
-        y_min = float(np.nanmin(tracks[..., 1])) if tracks.size else 0.0
-
-        within_x = (x_min >= -1.0) and (x_max <= float(width) + 1.0)
-        within_y = (y_min >= -1.0) and (y_max <= float(height) + 1.0)
-        in_bound_ratio_all = _track_inbound_ratio(
-            tracks=tracks,
-            visibility=visibility,
-            width=width,
-            height=height,
-        )
-        in_bound_ratio_frame0 = _track_inbound_ratio(
-            tracks=tracks,
-            visibility=visibility,
-            width=width,
-            height=height,
-            frame_slice=slice(0, 1),
-        )
-        looks_like_stage2_pixel_tracks = (
-            (in_bound_ratio_frame0 >= 0.98) or (in_bound_ratio_all >= 0.85)
-        )
-
-        if within_x and within_y:
-            # Already in output pixel space (e.g., transformed_tracks_grid*_survived.npz).
-            pass
-        elif looks_like_stage2_pixel_tracks:
-            # Out-of-frame points are expected in later frames; keep stage2 pixel coords as-is.
+        if normalize_track:
+            # These are raw pixel tracks from the same source resolution used for
+            # model-side normalization. Preserve out-of-frame coordinates; do not
+            # min/max-fit them, or UI-authored trajectories drift on overlay.
+            src_w = float(max(normalize_width, 1))
+            src_h = float(max(normalize_height, 1))
+            tracks[..., 0] = tracks[..., 0] / src_w * float(max(width, 1))
+            tracks[..., 1] = tracks[..., 1] / src_h * float(max(height, 1))
             print(
-                "[info] overlay: keeping raw pixel tracks with partial out-of-frame points "
-                f"(frame0_in_bound={in_bound_ratio_frame0:.4f}, "
-                f"all_in_bound={in_bound_ratio_all:.4f}, normalize_track={normalize_track})."
+                "[info] overlay: mapped raw pixel tracks by explicit source resolution "
+                f"width={src_w:.0f} height={src_h:.0f} -> output width={width} height={height}."
             )
         else:
-            # Fallback: map raw tracks to frame extent.
-            x_max = max(x_max, 1.0)
-            y_max = max(y_max, 1.0)
-            tracks[..., 0] = tracks[..., 0] / x_max * float(max(width - 1, 1))
-            tracks[..., 1] = tracks[..., 1] / y_max * float(max(height - 1, 1))
-            print(
-                "[info] overlay: fallback-scaled out-of-range raw tracks "
-                f"(x_min={x_min:.2f}, x_max={x_max:.2f}, "
-                f"y_min={y_min:.2f}, y_max={y_max:.2f})."
+            x_max = float(np.nanmax(tracks[..., 0])) if tracks.size else 1.0
+            x_min = float(np.nanmin(tracks[..., 0])) if tracks.size else 0.0
+            y_max = float(np.nanmax(tracks[..., 1])) if tracks.size else 1.0
+            y_min = float(np.nanmin(tracks[..., 1])) if tracks.size else 0.0
+
+            within_x = (x_min >= -1.0) and (x_max <= float(width) + 1.0)
+            within_y = (y_min >= -1.0) and (y_max <= float(height) + 1.0)
+            in_bound_ratio_all = _track_inbound_ratio(
+                tracks=tracks,
+                visibility=visibility,
+                width=width,
+                height=height,
             )
+            in_bound_ratio_frame0 = _track_inbound_ratio(
+                tracks=tracks,
+                visibility=visibility,
+                width=width,
+                height=height,
+                frame_slice=slice(0, 1),
+            )
+            looks_like_stage2_pixel_tracks = (
+                (in_bound_ratio_frame0 >= 0.98) or (in_bound_ratio_all >= 0.85)
+            )
+
+            if within_x and within_y:
+                # Already in output pixel space (e.g., transformed_tracks_grid*_survived.npz).
+                pass
+            elif looks_like_stage2_pixel_tracks:
+                # Out-of-frame points are expected in later frames; keep stage2 pixel coords as-is.
+                print(
+                    "[info] overlay: keeping raw pixel tracks with partial out-of-frame points "
+                    f"(frame0_in_bound={in_bound_ratio_frame0:.4f}, "
+                    f"all_in_bound={in_bound_ratio_all:.4f}, normalize_track={normalize_track})."
+                )
+            else:
+                # Fallback: map raw tracks to frame extent.
+                x_max = max(x_max, 1.0)
+                y_max = max(y_max, 1.0)
+                tracks[..., 0] = tracks[..., 0] / x_max * float(max(width - 1, 1))
+                tracks[..., 1] = tracks[..., 1] / y_max * float(max(height - 1, 1))
+                print(
+                    "[info] overlay: fallback-scaled out-of-range raw tracks "
+                    f"(x_min={x_min:.2f}, x_max={x_max:.2f}, "
+                    f"y_min={y_min:.2f}, y_max={y_max:.2f})."
+                )
 
     frames = (
         sample[0]

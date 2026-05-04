@@ -66,6 +66,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_data_dir", type=str, default=None)
     parser.add_argument("--train_data_meta_track", type=str, default=None)
     parser.add_argument(
+        "--train_dataset_specs_track",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON manifest with metadata/root pairs for multi-dataset training. "
+            "When set, it overrides --train_data_meta_track for the train dataloader."
+        ),
+    )
+    parser.add_argument(
         "--val_data_meta_track",
         type=str,
         default=None,
@@ -366,6 +375,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--track_latent_first_frame_scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional absolute scale for track_head output at latent frame 0. "
+            "When omitted, --track_latent_scale is used."
+        ),
+    )
+    parser.add_argument(
+        "--track_latent_rest_frame_scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional absolute scale for track_head output at latent frames 1:. "
+            "When omitted, --track_latent_scale is used."
+        ),
+    )
+    parser.add_argument(
         "--add_track_init_noise",
         type=_str2bool,
         default=False,
@@ -568,6 +595,86 @@ def _parse_root_map(args: argparse.Namespace) -> Optional[Dict[str, str]]:
     return root_map
 
 
+def _resolve_specs_path(value: str, specs_dir: str) -> str:
+    value = os.path.expanduser(str(value).strip())
+    if value == "":
+        return value
+    if os.path.isabs(value):
+        return os.path.abspath(value)
+    return os.path.abspath(os.path.join(specs_dir, value))
+
+
+def _load_train_dataset_specs_track(
+    specs_path: str,
+    root_id_key: str,
+) -> Tuple[List[Dict], Dict[str, str], List[Dict[str, object]]]:
+    specs_abs = os.path.abspath(os.path.expanduser(specs_path))
+    specs_dir = os.path.dirname(specs_abs)
+    with open(specs_abs, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    if isinstance(loaded, dict):
+        loaded = loaded.get("datasets", None)
+    if not isinstance(loaded, list):
+        raise ValueError(
+            "--train_dataset_specs_track must be a JSON list or an object with a `datasets` list."
+        )
+
+    merged_records: List[Dict] = []
+    root_map: Dict[str, str] = {}
+    summary: List[Dict[str, object]] = []
+    seen_root_ids = set()
+    for idx, spec in enumerate(loaded):
+        if not isinstance(spec, dict):
+            raise ValueError(f"Dataset spec index={idx} must be a JSON object.")
+
+        dataset_id = str(spec.get("name", spec.get("id", ""))).strip()
+        if dataset_id == "":
+            raise ValueError(f"Dataset spec index={idx} is missing non-empty `name` or `id`.")
+        if dataset_id in seen_root_ids:
+            raise ValueError(f"Duplicate dataset spec name/id: {dataset_id}")
+        seen_root_ids.add(dataset_id)
+
+        meta_path = spec.get("metadata", spec.get("meta", spec.get("ann_path", None)))
+        root_path = spec.get("root", spec.get("dataset_root", spec.get("data_root", None)))
+        if meta_path is None or str(meta_path).strip() == "":
+            raise ValueError(f"Dataset spec '{dataset_id}' is missing `metadata`.")
+        if root_path is None or str(root_path).strip() == "":
+            raise ValueError(f"Dataset spec '{dataset_id}' is missing `root`.")
+
+        meta_abs = _resolve_specs_path(str(meta_path), specs_dir)
+        root_abs = _resolve_specs_path(str(root_path), specs_dir)
+        if not os.path.isfile(meta_abs):
+            raise FileNotFoundError(f"Metadata file not found for dataset spec '{dataset_id}': {meta_abs}")
+
+        with open(meta_abs, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        if not isinstance(records, list):
+            raise ValueError(f"Metadata for dataset spec '{dataset_id}' must be a JSON list: {meta_abs}")
+
+        root_map[dataset_id] = root_abs
+        for row_idx, record in enumerate(records):
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"Metadata row must be an object: dataset='{dataset_id}' row={row_idx}"
+                )
+            merged = dict(record)
+            merged[root_id_key] = dataset_id
+            merged_records.append(merged)
+
+        summary.append(
+            {
+                "name": dataset_id,
+                "metadata": meta_abs,
+                "root": root_abs,
+                "num_records": len(records),
+            }
+        )
+
+    if len(merged_records) == 0:
+        raise ValueError(f"No records loaded from train dataset specs: {specs_abs}")
+    return merged_records, root_map, summary
+
+
 def _sniff_metadata_source_media(meta_path: str, max_bytes: int = 1_000_000) -> Optional[str]:
     """Best-effort metadata mode sniffing without full JSON parsing."""
     try:
@@ -590,6 +697,43 @@ def _sniff_metadata_source_media(meta_path: str, max_bytes: int = 1_000_000) -> 
     if ".mp4" in text:
         return "video"
     return None
+
+
+def _sniff_metadata_records_source_media(records: List[Dict], max_records: int = 0) -> Optional[str]:
+    has_latent = False
+    has_video = False
+    limit = len(records) if int(max_records) <= 0 else min(len(records), int(max_records))
+    for record in records[:limit]:
+        if not isinstance(record, dict):
+            continue
+        source_media = str(record.get("source_media", "")).strip().lower()
+        file_path = str(record.get("file_path", "")).strip().lower()
+        latent_file_path = str(record.get("latent_file_path", "")).strip().lower()
+        if source_media == "latent" or latent_file_path != "" or "vae_latents.pt" in file_path:
+            has_latent = True
+        if source_media == "video" or file_path.endswith(".mp4"):
+            has_video = True
+    if has_latent and has_video:
+        return "mixed"
+    if has_latent:
+        return "latent"
+    if has_video:
+        return "video"
+    return None
+
+
+def _merge_root_maps(
+    specs_root_map: Optional[Dict[str, str]],
+    cli_root_map: Optional[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    merged: Dict[str, str] = {}
+    if specs_root_map:
+        merged.update(specs_root_map)
+    if cli_root_map:
+        merged.update(cli_root_map)
+    if len(merged) == 0:
+        return None
+    return merged
 
 
 def _make_fixed_subset_indices(length: int, subset_size: int, seed: int) -> List[int]:
@@ -2069,6 +2213,33 @@ def main() -> None:
         raise ValueError("--track_latent_scale must be finite.")
     if float(args.track_latent_scale) < 0.0:
         raise ValueError("--track_latent_scale must be >= 0.")
+    split_track_latent_scale = (
+        args.track_latent_first_frame_scale is not None
+        or args.track_latent_rest_frame_scale is not None
+    )
+    if args.track_latent_first_frame_scale is not None:
+        if not math.isfinite(float(args.track_latent_first_frame_scale)):
+            raise ValueError("--track_latent_first_frame_scale must be finite.")
+        if float(args.track_latent_first_frame_scale) < 0.0:
+            raise ValueError("--track_latent_first_frame_scale must be >= 0.")
+    if args.track_latent_rest_frame_scale is not None:
+        if not math.isfinite(float(args.track_latent_rest_frame_scale)):
+            raise ValueError("--track_latent_rest_frame_scale must be finite.")
+        if float(args.track_latent_rest_frame_scale) < 0.0:
+            raise ValueError("--track_latent_rest_frame_scale must be >= 0.")
+    if split_track_latent_scale:
+        args.track_latent_first_frame_scale = (
+            float(args.track_latent_scale)
+            if args.track_latent_first_frame_scale is None
+            else float(args.track_latent_first_frame_scale)
+        )
+        args.track_latent_rest_frame_scale = (
+            float(args.track_latent_scale)
+            if args.track_latent_rest_frame_scale is None
+            else float(args.track_latent_rest_frame_scale)
+        )
+        os.environ["TRACK_LATENT_FIRST_FRAME_SCALE"] = str(args.track_latent_first_frame_scale)
+        os.environ["TRACK_LATENT_REST_FRAME_SCALE"] = str(args.track_latent_rest_frame_scale)
     if not math.isfinite(float(args.track_init_noise_scale)):
         raise ValueError("--track_init_noise_scale must be finite.")
     if float(args.track_init_noise_scale) < 0.0:
@@ -2077,13 +2248,46 @@ def main() -> None:
         raise ValueError(
             "--resume_from_checkpoint_track and --init_model_from_checkpoint_track are mutually exclusive."
         )
-    root_map = _parse_root_map(args)
+    cli_root_map = _parse_root_map(args)
+    train_metadata_records_track: Optional[List[Dict]] = None
+    dataset_specs_summary_track: List[Dict[str, object]] = []
+    specs_root_map_track: Optional[Dict[str, str]] = None
+    if args.train_dataset_specs_track:
+        (
+            train_metadata_records_track,
+            specs_root_map_track,
+            dataset_specs_summary_track,
+        ) = _load_train_dataset_specs_track(
+            args.train_dataset_specs_track,
+            args.train_data_root_id_key_track,
+        )
+    root_map = _merge_root_maps(specs_root_map_track, cli_root_map)
     os.makedirs(args.output_dir_track, exist_ok=True)
     if args.checkpoint_dir_track:
         os.makedirs(args.checkpoint_dir_track, exist_ok=True)
-    if (not args.dummy_data_track) and (args.train_data_meta_track is None):
-        raise ValueError("--train_data_meta_track is required unless --dummy_data_track is set.")
-    if (not args.dummy_data_track) and args.train_data_meta_track is not None:
+    if (
+        (not args.dummy_data_track)
+        and train_metadata_records_track is None
+        and args.train_data_meta_track is None
+    ):
+        raise ValueError(
+            "--train_data_meta_track or --train_dataset_specs_track is required unless --dummy_data_track is set."
+        )
+    if (not args.dummy_data_track) and train_metadata_records_track is not None:
+        detected_source_media = _sniff_metadata_records_source_media(train_metadata_records_track)
+        if detected_source_media == "mixed":
+            raise ValueError(
+                "--train_dataset_specs_track loaded mixed latent/video metadata; "
+                "the train dataloader currently expects one input_mode_track."
+            )
+        if detected_source_media == "latent" and args.input_mode_track != "latent":
+            logger.warning(
+                "Detected latent metadata from %s; overriding --input_mode_track=%s -> latent",
+                args.train_dataset_specs_track,
+                args.input_mode_track,
+            )
+            args.input_mode_track = "latent"
+    elif (not args.dummy_data_track) and args.train_data_meta_track is not None:
         detected_source_media = _sniff_metadata_source_media(args.train_data_meta_track)
         if detected_source_media == "latent" and args.input_mode_track != "latent":
             logger.warning(
@@ -2175,7 +2379,11 @@ def main() -> None:
             raise ValueError("--track_head_hidden_dim must be > 0 when provided.")
         transformer_additional_kwargs["track_head_hidden_dim"] = int(args.track_head_hidden_dim)
     if args.track_condition_mode == "track_head":
-        transformer_additional_kwargs["track_latent_scale"] = float(args.track_latent_scale)
+        transformer_additional_kwargs["track_latent_scale"] = (
+            float(args.track_latent_rest_frame_scale)
+            if split_track_latent_scale
+            else float(args.track_latent_scale)
+        )
 
     transformer_cls = WanTransformer3DModelTrack if args.track_condition_mode == "track_head" else WanTransformer3DModel
     transformer3d_track = transformer_cls.from_pretrained(
@@ -2413,8 +2621,13 @@ def main() -> None:
             text="dummy track prompt",
         )
     elif args.input_mode_track == "latent":
+        train_ann_track = (
+            train_metadata_records_track
+            if train_metadata_records_track is not None
+            else args.train_data_meta_track
+        )
         train_dataset = ImageVideoLatentTrackDataset(
-            args.train_data_meta_track,
+            train_ann_track,
             args.train_data_dir,
             text_drop_ratio=float(args.text_drop_ratio_track),
             track_condition_key=args.track_condition_key,
@@ -2424,8 +2637,13 @@ def main() -> None:
             root_id_key=args.train_data_root_id_key_track,
         )
     else:
+        train_ann_track = (
+            train_metadata_records_track
+            if train_metadata_records_track is not None
+            else args.train_data_meta_track
+        )
         train_dataset = ImageVideoDatasetTrack(
-            args.train_data_meta_track,
+            train_ann_track,
             args.train_data_dir,
             video_sample_size=args.video_sample_size,
             video_sample_stride=args.video_sample_stride,
@@ -2441,6 +2659,24 @@ def main() -> None:
         )
 
     if accelerator.is_main_process and (not args.dummy_data_track):
+        if dataset_specs_summary_track:
+            specs_msg = (
+                f"train_dataset_specs_track={args.train_dataset_specs_track} "
+                f"datasets={len(dataset_specs_summary_track)} "
+                f"records={len(train_metadata_records_track or [])}"
+            )
+            logger.info(specs_msg)
+            accelerator.print(specs_msg)
+            for spec_summary in dataset_specs_summary_track:
+                detail_msg = (
+                    "train_dataset_spec "
+                    f"name={spec_summary['name']} "
+                    f"records={spec_summary['num_records']} "
+                    f"root={spec_summary['root']} "
+                    f"metadata={spec_summary['metadata']}"
+                )
+                logger.info(detail_msg)
+                accelerator.print(detail_msg)
         tdr_msg = (
             f"text_drop_ratio_track={float(args.text_drop_ratio_track)} "
             "(validation text_drop_ratio=0)"

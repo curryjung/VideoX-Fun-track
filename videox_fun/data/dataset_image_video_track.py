@@ -87,6 +87,9 @@ class ImageVideoDatasetTrack(ImageVideoDataset):
     def _resolve_track_path(self, track_file_path: str, data_info: Optional[Dict] = None) -> str:
         return self._resolve_data_path_with_root(track_file_path, data_info=data_info)
 
+    def _resolve_data_path(self, data_path: str, data_info: Optional[Dict] = None) -> str:
+        return self._resolve_data_path_with_root(data_path, data_info=data_info)
+
     def _load_track_condition(self, track_file_path: str) -> Dict[str, torch.Tensor]:
         data = np.load(track_file_path)
 

@@ -14,13 +14,16 @@ TRAIN_DATA_DIR="/data/shared-vilab/datasets/OpenVid-1M"
 # SAMPLE_INDEX_LIST=(27)
 # SAMPLE_INDEX_LIST=(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29)
 # SAMPLE_INDEX_LIST=(19 7 2)
-SAMPLE_INDEX_LIST=(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29)
-TRACK_LATENT_SCALE_LIST=(4.0)
+SAMPLE_INDEX_LIST=(0 1 2 3 4 5 6 7 8 9 10)
+TRACK_LATENT_SCALE_LIST=(1.0)
+# Optional split scale. Leave empty to use TRACK_LATENT_SCALE for both.
+# Example: TRACK_LATENT_FIRST_FRAME_SCALE=1.0, TRACK_LATENT_REST_FRAME_SCALE=4.0
+TRACK_LATENT_FIRST_FRAME_SCALE="${TRACK_LATENT_FIRST_FRAME_SCALE:-0.5}"
+TRACK_LATENT_REST_FRAME_SCALE="${TRACK_LATENT_REST_FRAME_SCALE:-2.0}"
 SEED_LIST=(42 41)
 # SEED_LIST=(39 38 37 36 35 34 33 32)
 # SEED_LIST=(42 41 40)
 # SEED_LIST=(42)
-
 
 ckpt_list=(1700 1600 1500 1400 1300 1200 1100 1000 900)
 ckpt_list=(1200 1100 1000 900)
@@ -33,7 +36,8 @@ ckpt_list=(5600)
 ckpt_list=(200 400 600 800 1000 1200 1400 1600 1800)
 ckpt_list=(1400 1200 1000 800 600 400 200)
 ckpt_list=(1600)
-ckpt_list=(600)
+ckpt_list=(9400)
+ckpt_list=(1000)
 # /data/project-vilab/jaeseok/VideoX-Fun/checkpoints/wan_track_track-patch-embed-init-track_bs16_alpha_1p0_init_noise_0p01_bin8_train_78k_h_dim_64_dropout_first-frame_0p1_text_0p1_track_0p1/checkpoint-2800
 # EXP_NAME="wan_track_track-patch-embed-init-track-alpha_1p0_init_noise_0p01_selected64_h_dim_256_dropout_first-frame_0p1_text_0p1_track_0p1"
 EXP_NAME="wan_track_track-patch-embed-init-track_bs16_alpha_1p0_init_noise_0p01_selected64_h_dim_64_dropout_first-frame_0p1_text_0p1_track_0p1"
@@ -78,7 +82,17 @@ for ckpt in "${ckpt_list[@]}"; do
     for SEED in "${SEED_LIST[@]}"; do
         for SAMPLE_INDEX in "${SAMPLE_INDEX_LIST[@]}"; do
             for TRACK_LATENT_SCALE in "${TRACK_LATENT_SCALE_LIST[@]}"; do
-                SAVE_DIR="${SAVE_BASE_DIR}/sample_idx_${SAMPLE_INDEX}/scale_${TRACK_LATENT_SCALE}"
+                TRACK_LATENT_FIRST_FRAME_SCALE_RUN="${TRACK_LATENT_FIRST_FRAME_SCALE}"
+                TRACK_LATENT_REST_FRAME_SCALE_RUN="${TRACK_LATENT_REST_FRAME_SCALE}"
+                TRACK_LATENT_SCALE_SUFFIX="s${TRACK_LATENT_SCALE}"
+                SAVE_DIR_SCALE_SUFFIX="scale_${TRACK_LATENT_SCALE}"
+                if [[ -n "${TRACK_LATENT_FIRST_FRAME_SCALE_RUN}" || -n "${TRACK_LATENT_REST_FRAME_SCALE_RUN}" ]]; then
+                    TRACK_LATENT_FIRST_FRAME_SCALE_RUN="${TRACK_LATENT_FIRST_FRAME_SCALE_RUN:-${TRACK_LATENT_SCALE}}"
+                    TRACK_LATENT_REST_FRAME_SCALE_RUN="${TRACK_LATENT_REST_FRAME_SCALE_RUN:-${TRACK_LATENT_SCALE}}"
+                    TRACK_LATENT_SCALE_SUFFIX="sf${TRACK_LATENT_FIRST_FRAME_SCALE_RUN}_sr${TRACK_LATENT_REST_FRAME_SCALE_RUN}"
+                    SAVE_DIR_SCALE_SUFFIX="scale_first_${TRACK_LATENT_FIRST_FRAME_SCALE_RUN}_rest_${TRACK_LATENT_REST_FRAME_SCALE_RUN}"
+                fi
+                SAVE_DIR="${SAVE_BASE_DIR}/sample_idx_${SAMPLE_INDEX}/${SAVE_DIR_SCALE_SUFFIX}"
                 mkdir -p "${SAVE_DIR}"
                 DEBUG_TRACK_CONDITION="${DEBUG_TRACK_CONDITION:-true}"
                 TRACK_ANALYSIS="${TRACK_ANALYSIS:-true}"
@@ -86,8 +100,8 @@ for ckpt in "${ckpt_list[@]}"; do
                 if [[ "${TRACK_MAX_POINTS}" != "-1" ]]; then
                     TRACK_POINTS_SUFFIX="p${TRACK_MAX_POINTS}"
                 fi
-                OUTPUT_NAME_SUFFIX="motiononly_wt${TEXT_GUIDANCE_WEIGHT}_wm${MOTION_GUIDANCE_WEIGHT}_${TRACK_POINTS_SUFFIX}_s${TRACK_LATENT_SCALE}_toff${TRACK_CONDITION_INDEX_OFFSET}_seed${SEED}"
-                CUDA_VISIBLE_DEVICES=6 \
+                OUTPUT_NAME_SUFFIX="motiononly_wt${TEXT_GUIDANCE_WEIGHT}_wm${MOTION_GUIDANCE_WEIGHT}_${TRACK_POINTS_SUFFIX}_ff${TRACK_LATENT_FIRST_FRAME_SCALE_RUN}_rf${TRACK_LATENT_REST_FRAME_SCALE_RUN}_toff${TRACK_CONDITION_INDEX_OFFSET}_seed${SEED}"
+                CUDA_VISIBLE_DEVICES=5 \
                 TRANSFORMER_CHECKPOINT_PATH="${TRANSFORMER_CHECKPOINT_PATH}" \
                 METADATA_PATH="${VAL_METADATA_PATH}" \
                 TRAIN_DATA_DIR="${TRAIN_DATA_DIR}" \
@@ -103,6 +117,8 @@ for ckpt in "${ckpt_list[@]}"; do
                 TRACK_NORMALIZE="${TRACK_NORMALIZE}" \
                 TRACK_HEAD_HIDDEN_DIM="${TRACK_HEAD_HIDDEN_DIM}" \
                 TRACK_LATENT_SCALE="${TRACK_LATENT_SCALE}" \
+                TRACK_LATENT_FIRST_FRAME_SCALE="${TRACK_LATENT_FIRST_FRAME_SCALE_RUN}" \
+                TRACK_LATENT_REST_FRAME_SCALE="${TRACK_LATENT_REST_FRAME_SCALE_RUN}" \
                 TRACK_CONDITION_INDEX_OFFSET="${TRACK_CONDITION_INDEX_OFFSET}" \
                 TRACK_POINT_SAMPLE_MODE="${TRACK_POINT_SAMPLE_MODE}" \
                 TRACK_SORT_SELECTED_INDICES="${TRACK_SORT_SELECTED_INDICES}" \

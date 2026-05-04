@@ -173,6 +173,7 @@ cython_debug/
 checkpoints/
 wandb/
 vis_tracks_on_decoded_reference.mp4
+wisa-80k.json
 
 # Track builder local environments/build outputs
 track_builder_ui/backend/.venv/

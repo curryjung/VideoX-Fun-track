@@ -52,6 +52,8 @@ PDB_PIPELINE_STEP0="${PDB_PIPELINE_STEP0:-false}"
 FORCE_TRACK_CONDITION_NONE="${FORCE_TRACK_CONDITION_NONE:-false}"
 RANDOM_FAKE_TRACK="${RANDOM_FAKE_TRACK:-false}"
 TRACK_LATENT_SCALE="${TRACK_LATENT_SCALE:-1.0}"
+TRACK_LATENT_FIRST_FRAME_SCALE="${TRACK_LATENT_FIRST_FRAME_SCALE:-}"
+TRACK_LATENT_REST_FRAME_SCALE="${TRACK_LATENT_REST_FRAME_SCALE:-}"
 TRACK_HEAD_HIDDEN_DIM="${TRACK_HEAD_HIDDEN_DIM:-}"
 TRACK_CONDITION_INDEX_OFFSET="${TRACK_CONDITION_INDEX_OFFSET:-0}"
 TRACK_POINT_SAMPLE_MODE="${TRACK_POINT_SAMPLE_MODE:-uniform}"
@@ -115,6 +117,8 @@ echo "[trace_exec] track_analysis=${TRACK_ANALYSIS}"
 echo "[trace_exec] force_track_condition_none=${FORCE_TRACK_CONDITION_NONE}"
 echo "[trace_exec] random_fake_track=${RANDOM_FAKE_TRACK}"
 echo "[trace_exec] track_latent_scale=${TRACK_LATENT_SCALE}"
+echo "[trace_exec] track_latent_first_frame_scale=${TRACK_LATENT_FIRST_FRAME_SCALE:-<track_latent_scale>}"
+echo "[trace_exec] track_latent_rest_frame_scale=${TRACK_LATENT_REST_FRAME_SCALE:-<track_latent_scale>}"
 echo "[trace_exec] track_head_hidden_dim=${TRACK_HEAD_HIDDEN_DIM:-<config>}"
 echo "[trace_exec] track_condition_index_offset=${TRACK_CONDITION_INDEX_OFFSET}"
 echo "[trace_exec] track_point_sample_mode=${TRACK_POINT_SAMPLE_MODE}"
@@ -213,6 +217,12 @@ if [[ "${RANDOM_FAKE_TRACK}" == "true" ]]; then
 fi
 if [[ -n "${TRACK_LATENT_SCALE}" ]]; then
   EXTRA_ARGS+=("--track_latent_scale=${TRACK_LATENT_SCALE}")
+fi
+if [[ -n "${TRACK_LATENT_FIRST_FRAME_SCALE}" ]]; then
+  export TRACK_LATENT_FIRST_FRAME_SCALE
+fi
+if [[ -n "${TRACK_LATENT_REST_FRAME_SCALE}" ]]; then
+  export TRACK_LATENT_REST_FRAME_SCALE
 fi
 if [[ -n "${TRACK_HEAD_HIDDEN_DIM}" ]]; then
   EXTRA_ARGS+=("--track_head_hidden_dim=${TRACK_HEAD_HIDDEN_DIM}")

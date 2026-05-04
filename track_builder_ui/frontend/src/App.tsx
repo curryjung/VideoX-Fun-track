@@ -1,8 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import JSZip from "jszip";
+import ArchivePanel from "./components/ArchivePanel";
+import GenerationControls from "./components/GenerationControls";
+import QueuePanel from "./components/QueuePanel";
 import TrackCanvas from "./components/TrackCanvas";
 import TrackPreview from "./components/TrackPreview";
-import type { GridConfig, TrackDocument, TrackPath } from "./types";
+import type { GenerationMode, GridConfig, JobRecord, TrackDocument, TrackPath } from "./types";
 
 const FRAME_COUNT = 81;
 const DEFAULT_IMAGE_WIDTH = 832;
@@ -10,6 +13,14 @@ const DEFAULT_IMAGE_HEIGHT = 480;
 const BACKEND_BASE_URL =
   (import.meta.env.VITE_BACKEND_URL as string | undefined)?.trim() ?? "";
 const DEFAULT_FLORENCE_TASK = "<MORE_DETAILED_CAPTION>";
+
+type TrackPackageArtifacts = {
+  trackNpzBlob: Blob;
+  firstFrameBlob: Blob;
+  previewBlob: Blob | null;
+  pointCount: number;
+  pathCount: number;
+};
 
 function buildApiUrl(path: string): string {
   if (!BACKEND_BASE_URL) {
@@ -19,6 +30,10 @@ function buildApiUrl(path: string): string {
     ? BACKEND_BASE_URL.slice(0, -1)
     : BACKEND_BASE_URL;
   return `${base}${path}`;
+}
+
+function encodeRelativeUrlPath(path: string): string {
+  return path.split("/").map((part) => encodeURIComponent(part)).join("/");
 }
 
 function generatePathId(): string {
@@ -416,6 +431,7 @@ function dataUrlToBlob(dataUrl: string): Blob | null {
 }
 
 export default function App(): JSX.Element {
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<"builder" | "archive">("builder");
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   const [imageSrc, setImageSrc] = useState<string>("");
   const [activeObjectUrl, setActiveObjectUrl] = useState<string | null>(null);
@@ -448,6 +464,15 @@ export default function App(): JSX.Element {
   const [serverExportPath, setServerExportPath] = useState<string>("/data/project-vilab/jaeseok/VideoX-Fun/asset/track_samples/");
   const [serverExportSubDir, setServerExportSubDir] = useState<string>("");
   const [localDownload, setLocalDownload] = useState<boolean>(true);
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("motion_only");
+  const [generationPrompt, setGenerationPrompt] = useState<string>("a video");
+  const [generationSeed, setGenerationSeed] = useState<number>(42);
+  const [textGuidanceWeight, setTextGuidanceWeight] = useState<number>(0.0);
+  const [motionGuidanceWeight, setMotionGuidanceWeight] = useState<number>(3.0);
+  const [isQueueing, setIsQueueing] = useState<boolean>(false);
+  const [jobs, setJobs] = useState<JobRecord[]>([]);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [selectedJobLog, setSelectedJobLog] = useState<string>("");
 
   useEffect(() => {
     if (image) {
@@ -467,6 +492,70 @@ export default function App(): JSX.Element {
     };
     demoImage.src = demoSrc;
   }, [image]);
+
+  const loadJobs = async (): Promise<void> => {
+    try {
+      const response = await fetch(buildApiUrl("/api/jobs"));
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as { jobs?: JobRecord[] };
+      setJobs(Array.isArray(payload.jobs) ? payload.jobs : []);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unknown error";
+      setStatus(`Failed to refresh jobs: ${reason}`);
+    }
+  };
+
+  const loadSelectedJobLog = async (jobId: string): Promise<void> => {
+    try {
+      const response = await fetch(buildApiUrl(`/api/jobs/${jobId}/log`));
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as { text?: string };
+      setSelectedJobLog(payload.text ?? "");
+    } catch {
+      setSelectedJobLog("");
+    }
+  };
+
+  useEffect(() => {
+    void loadJobs();
+    const interval = window.setInterval(() => {
+      void loadJobs();
+    }, 4000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedJobId) {
+      setSelectedJobLog("");
+      return;
+    }
+    void loadSelectedJobLog(selectedJobId);
+    const interval = window.setInterval(() => {
+      void loadSelectedJobLog(selectedJobId);
+    }, 3000);
+    return () => window.clearInterval(interval);
+  }, [selectedJobId]);
+
+  const buildJobFileUrl = (job: JobRecord, relPath: string): string =>
+    buildApiUrl(`/api/jobs/${job.job_id}/file/${encodeRelativeUrlPath(relPath)}`);
+
+  const handleGenerationModeChange = (mode: GenerationMode): void => {
+    setGenerationMode(mode);
+    if (mode === "text_only") {
+      setTextGuidanceWeight(3.0);
+      setMotionGuidanceWeight(0.0);
+    } else if (mode === "joint_tm") {
+      setTextGuidanceWeight(3.0);
+      setMotionGuidanceWeight(1.5);
+    } else {
+      setTextGuidanceWeight(0.0);
+      setMotionGuidanceWeight(3.0);
+    }
+  };
 
   const displayPaths = useMemo(
     () =>
@@ -503,6 +592,21 @@ export default function App(): JSX.Element {
         0
       ),
     [paths]
+  );
+  const canAddToQueue = Boolean(image) && totalPointCount > 0 && !isRecording;
+  const archiveJobCount = useMemo(
+    () =>
+      jobs.filter((job) =>
+        job.status === "done" ||
+        job.status === "failed" ||
+        job.status === "canceled" ||
+        job.status === "interrupted"
+      ).length,
+    [jobs]
+  );
+  const activeJobCount = useMemo(
+    () => jobs.filter((job) => job.status === "queued" || job.status === "running").length,
+    [jobs]
   );
 
   useEffect(() => {
@@ -936,7 +1040,7 @@ export default function App(): JSX.Element {
     setStatus("Exported track_document.json");
   };
 
-  const exportTrackPackage = async (): Promise<void> => {
+  const buildTrackPackageArtifacts = async (): Promise<TrackPackageArtifacts> => {
     const exportPaths = paths
       .map((path) => {
         const keyframes = ensureKeyframes(path, FRAME_COUNT);
@@ -949,126 +1053,141 @@ export default function App(): JSX.Element {
       .filter((item) => item.pointCount > 0);
 
     if (exportPaths.length === 0) {
-      setStatus("No path available to export");
-      return;
+      throw new Error("No path available to export");
     }
     if (!image) {
-      setStatus("No image available to export");
-      return;
+      throw new Error("No image available to export");
     }
 
-    try {
-      const pointCount = exportPaths.reduce((sum, item) => sum + item.pointCount, 0);
-      if (pointCount <= 0) {
-        setStatus("No point-cloud points available to export");
-        return;
-      }
+    const pointCount = exportPaths.reduce((sum, item) => sum + item.pointCount, 0);
+    if (pointCount <= 0) {
+      throw new Error("No point-cloud points available to export");
+    }
 
-      const tracks = new Float32Array(FRAME_COUNT * pointCount * 2);
-      const visibility = new Float32Array(FRAME_COUNT * pointCount);
-      let pointOffset = 0;
-      for (const item of exportPaths) {
-        for (let frame = 0; frame < FRAME_COUNT; frame += 1) {
-          const framePoints = item.keyframes[frame] ?? [];
-          for (let localPointIndex = 0; localPointIndex < item.pointCount; localPointIndex += 1) {
-            const globalPointIndex = pointOffset + localPointIndex;
-            const point = framePoints[localPointIndex];
-            const baseTrackIdx = (frame * pointCount + globalPointIndex) * 2;
-            if (point) {
-              tracks[baseTrackIdx] = point.x;
-              tracks[baseTrackIdx + 1] = point.y;
-              visibility[frame * pointCount + globalPointIndex] = 1;
-            } else {
-              tracks[baseTrackIdx] = 0;
-              tracks[baseTrackIdx + 1] = 0;
-              visibility[frame * pointCount + globalPointIndex] = 0;
-            }
+    const tracks = new Float32Array(FRAME_COUNT * pointCount * 2);
+    const visibility = new Float32Array(FRAME_COUNT * pointCount);
+    let pointOffset = 0;
+    for (const item of exportPaths) {
+      for (let frame = 0; frame < FRAME_COUNT; frame += 1) {
+        const framePoints = item.keyframes[frame] ?? [];
+        for (let localPointIndex = 0; localPointIndex < item.pointCount; localPointIndex += 1) {
+          const globalPointIndex = pointOffset + localPointIndex;
+          const point = framePoints[localPointIndex];
+          const baseTrackIdx = (frame * pointCount + globalPointIndex) * 2;
+          if (point) {
+            tracks[baseTrackIdx] = point.x;
+            tracks[baseTrackIdx + 1] = point.y;
+            visibility[frame * pointCount + globalPointIndex] = 1;
+          } else {
+            tracks[baseTrackIdx] = 0;
+            tracks[baseTrackIdx + 1] = 0;
+            visibility[frame * pointCount + globalPointIndex] = 0;
           }
         }
-        pointOffset += item.pointCount;
       }
+      pointOffset += item.pointCount;
+    }
 
-      const validIdx = new BigInt64Array(pointCount);
-      for (let i = 0; i < pointCount; i += 1) {
-        validIdx[i] = BigInt(i);
-      }
+    const validIdx = new BigInt64Array(pointCount);
+    for (let i = 0; i < pointCount; i += 1) {
+      validIdx[i] = BigInt(i);
+    }
 
-      const trackNpzZip = new JSZip();
-      trackNpzZip.file(
-        "tracks_compressed.npy",
-        makeNpyBuffer("<f4", [FRAME_COUNT, pointCount, 2], typedArrayBytes(tracks))
-      );
-      trackNpzZip.file(
-        "visibility_compressed.npy",
-        makeNpyBuffer("<f4", [FRAME_COUNT, pointCount], typedArrayBytes(visibility))
-      );
-      trackNpzZip.file(
-        "valid_idx.npy",
-        makeNpyBuffer("<i8", [pointCount], typedArrayBytes(validIdx))
-      );
-      const trackNpzBlob = await trackNpzZip.generateAsync({
-        type: "blob",
-        compression: "DEFLATE"
-      });
+    const trackNpzZip = new JSZip();
+    trackNpzZip.file(
+      "tracks_compressed.npy",
+      makeNpyBuffer("<f4", [FRAME_COUNT, pointCount, 2], typedArrayBytes(tracks))
+    );
+    trackNpzZip.file(
+      "visibility_compressed.npy",
+      makeNpyBuffer("<f4", [FRAME_COUNT, pointCount], typedArrayBytes(visibility))
+    );
+    trackNpzZip.file(
+      "valid_idx.npy",
+      makeNpyBuffer("<i8", [pointCount], typedArrayBytes(validIdx))
+    );
+    const trackNpzBlob = await trackNpzZip.generateAsync({
+      type: "blob",
+      compression: "DEFLATE"
+    });
 
-      const firstFrameCanvas = document.createElement("canvas");
-      firstFrameCanvas.width = DEFAULT_IMAGE_WIDTH;
-      firstFrameCanvas.height = DEFAULT_IMAGE_HEIGHT;
-      const firstFrameCtx = firstFrameCanvas.getContext("2d");
-      if (!firstFrameCtx) {
-        setStatus("Failed to export first frame image");
-        return;
-      }
-      drawCenterCropCover(firstFrameCtx, image, DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT);
-      const firstFrameBlob = await canvasToPngBlob(firstFrameCanvas);
+    const firstFrameCanvas = document.createElement("canvas");
+    firstFrameCanvas.width = DEFAULT_IMAGE_WIDTH;
+    firstFrameCanvas.height = DEFAULT_IMAGE_HEIGHT;
+    const firstFrameCtx = firstFrameCanvas.getContext("2d");
+    if (!firstFrameCtx) {
+      throw new Error("Failed to export first frame image");
+    }
+    drawCenterCropCover(firstFrameCtx, image, DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT);
+    const firstFrameBlob = await canvasToPngBlob(firstFrameCanvas);
 
-      // Generate track preview PNG (all trajectories overlaid on first frame)
-      const previewCanvas = document.createElement("canvas");
-      previewCanvas.width = DEFAULT_IMAGE_WIDTH;
-      previewCanvas.height = DEFAULT_IMAGE_HEIGHT;
-      const previewCtx = previewCanvas.getContext("2d");
-      let previewBlob: Blob | null = null;
-      if (previewCtx) {
-        drawCenterCropCover(previewCtx, image, DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT);
-        let globalPointIndex = 0;
-        for (const item of exportPaths) {
-          for (let pi = 0; pi < item.pointCount; pi += 1) {
-            const hue = (globalPointIndex * 137.508) % 360;
-            const h = hue / 60;
-            const s = 0.9, l = 0.6;
-            const c = (1 - Math.abs(2 * l - 1)) * s;
-            const x = c * (1 - Math.abs(h % 2 - 1));
-            const m = l - c / 2;
-            let r = 0, g = 0, b = 0;
-            if (h < 1) { r = c; g = x; } else if (h < 2) { r = x; g = c; } else if (h < 3) { g = c; b = x; } else if (h < 4) { g = x; b = c; } else if (h < 5) { r = x; b = c; } else { r = c; b = x; }
-            const cr = Math.round((r + m) * 255), cg = Math.round((g + m) * 255), cb = Math.round((b + m) * 255);
-            previewCtx.save();
-            previewCtx.strokeStyle = `rgb(${cr},${cg},${cb})`;
-            previewCtx.lineWidth = 1.5;
-            previewCtx.globalAlpha = getTrackMode(item.path) === "static" ? 0.35 : 0.75;
-            previewCtx.beginPath();
-            const firstPt = item.keyframes[0][pi];
-            if (firstPt) {
-              previewCtx.moveTo(firstPt.x, firstPt.y);
-              for (let t = 1; t < FRAME_COUNT; t += 1) {
-                const p = item.keyframes[t][pi];
-                if (p) previewCtx.lineTo(p.x, p.y);
+    const previewCanvas = document.createElement("canvas");
+    previewCanvas.width = DEFAULT_IMAGE_WIDTH;
+    previewCanvas.height = DEFAULT_IMAGE_HEIGHT;
+    const previewCtx = previewCanvas.getContext("2d");
+    let previewBlob: Blob | null = null;
+    if (previewCtx) {
+      drawCenterCropCover(previewCtx, image, DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT);
+      let globalPointIndex = 0;
+      for (const item of exportPaths) {
+        for (let pi = 0; pi < item.pointCount; pi += 1) {
+          const hue = (globalPointIndex * 137.508) % 360;
+          const h = hue / 60;
+          const s = 0.9, l = 0.6;
+          const c = (1 - Math.abs(2 * l - 1)) * s;
+          const x = c * (1 - Math.abs(h % 2 - 1));
+          const m = l - c / 2;
+          let r = 0, g = 0, b = 0;
+          if (h < 1) { r = c; g = x; } else if (h < 2) { r = x; g = c; } else if (h < 3) { g = c; b = x; } else if (h < 4) { g = x; b = c; } else if (h < 5) { r = x; b = c; } else { r = c; b = x; }
+          const cr = Math.round((r + m) * 255), cg = Math.round((g + m) * 255), cb = Math.round((b + m) * 255);
+          previewCtx.save();
+          previewCtx.strokeStyle = `rgb(${cr},${cg},${cb})`;
+          previewCtx.lineWidth = 1.5;
+          previewCtx.globalAlpha = getTrackMode(item.path) === "static" ? 0.35 : 0.75;
+          previewCtx.beginPath();
+          const firstPt = item.keyframes[0][pi];
+          if (firstPt) {
+            previewCtx.moveTo(firstPt.x, firstPt.y);
+            for (let t = 1; t < FRAME_COUNT; t += 1) {
+              const p = item.keyframes[t][pi];
+              if (p) {
+                previewCtx.lineTo(p.x, p.y);
               }
             }
-            previewCtx.stroke();
-            previewCtx.restore();
-            const endPt = item.keyframes[FRAME_COUNT - 1][pi];
-            if (endPt) {
-              previewCtx.beginPath();
-              previewCtx.fillStyle = `rgb(${cr},${cg},${cb})`;
-              previewCtx.arc(endPt.x, endPt.y, 3.5, 0, Math.PI * 2);
-              previewCtx.fill();
-            }
-            globalPointIndex += 1;
           }
+          previewCtx.stroke();
+          previewCtx.restore();
+          const endPt = item.keyframes[FRAME_COUNT - 1][pi];
+          if (endPt) {
+            previewCtx.beginPath();
+            previewCtx.fillStyle = `rgb(${cr},${cg},${cb})`;
+            previewCtx.arc(endPt.x, endPt.y, 3.5, 0, Math.PI * 2);
+            previewCtx.fill();
+          }
+          globalPointIndex += 1;
         }
-        previewBlob = await canvasToPngBlob(previewCanvas);
       }
+      previewBlob = await canvasToPngBlob(previewCanvas);
+    }
+
+    return {
+      trackNpzBlob,
+      firstFrameBlob,
+      previewBlob,
+      pointCount,
+      pathCount: exportPaths.length
+    };
+  };
+
+  const exportTrackPackage = async (): Promise<void> => {
+    try {
+      const {
+        trackNpzBlob,
+        firstFrameBlob,
+        previewBlob,
+        pointCount,
+        pathCount
+      } = await buildTrackPackageArtifacts();
 
       // const captionFileContent = [
       //   `task_prompt: ${captionTask.trim() || DEFAULT_FLORENCE_TASK}`,
@@ -1107,7 +1226,7 @@ export default function App(): JSX.Element {
           return;
         }
         const result = await resp.json() as { directory: string };
-        setStatus(`Saved to server: ${result.directory} (${FRAME_COUNT} frames, ${pointCount} pts, ${exportPaths.length} tracks)`);
+        setStatus(`Saved to server: ${result.directory} (${FRAME_COUNT} frames, ${pointCount} pts, ${pathCount} tracks)`);
       }
 
       // Local download
@@ -1131,18 +1250,118 @@ export default function App(): JSX.Element {
         link.click();
         URL.revokeObjectURL(url);
         if (!baseDir) {
-          setStatus(`Exported track package: ${FRAME_COUNT} frames, ${pointCount} points, ${exportPaths.length} tracks`);
+          setStatus(`Exported track package: ${FRAME_COUNT} frames, ${pointCount} points, ${pathCount} tracks`);
         }
       }
 
       if (!baseDir && !localDownload) {
-        setStatus("Nothing exported — set a server path or enable local download.");
+        setStatus("Nothing exported - set a server path or enable local download.");
       }
     } catch (error) {
       setStatus(
         error instanceof Error
           ? `Failed to export track package: ${error.message}`
           : "Failed to export track package"
+      );
+    }
+  };
+
+  const addCurrentToQueue = async (): Promise<void> => {
+    setIsQueueing(true);
+    try {
+      const {
+        trackNpzBlob,
+        firstFrameBlob,
+        previewBlob,
+        pointCount,
+        pathCount
+      } = await buildTrackPackageArtifacts();
+      const formData = new FormData();
+      formData.append("image", firstFrameBlob, "first_frame.png");
+      formData.append("tracks_npz", trackNpzBlob, "transformed_tracks_grid50_survived.npz");
+      if (previewBlob) {
+        formData.append("preview_png", previewBlob, "track_preview.png");
+      }
+      formData.append("mode", generationMode);
+      formData.append("prompt", generationPrompt.trim() || "a video");
+      formData.append("seed", String(Number.isFinite(generationSeed) ? generationSeed : 42));
+      formData.append("text_guidance_weight", String(textGuidanceWeight));
+      formData.append("motion_guidance_weight", String(motionGuidanceWeight));
+
+      const response = await fetch(buildApiUrl("/api/jobs"), {
+        method: "POST",
+        body: formData
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as { job?: JobRecord };
+      if (payload.job) {
+        setSelectedJobId(payload.job.job_id);
+        setStatus(
+          `Queued ${payload.job.job_id}: ${pathCount} tracks, ${pointCount} points`
+        );
+      } else {
+        setStatus(`Queued generation: ${pathCount} tracks, ${pointCount} points`);
+      }
+      await loadJobs();
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? `Failed to queue generation: ${error.message}`
+          : "Failed to queue generation"
+      );
+    } finally {
+      setIsQueueing(false);
+    }
+  };
+
+  const cancelJob = async (jobId: string): Promise<void> => {
+    try {
+      const response = await fetch(buildApiUrl(`/api/jobs/${jobId}/cancel`), {
+        method: "POST"
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `HTTP ${response.status}`);
+      }
+      setStatus(`Canceled ${jobId}`);
+      await loadJobs();
+      if (selectedJobId === jobId) {
+        await loadSelectedJobLog(jobId);
+      }
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? `Failed to cancel job: ${error.message}`
+          : "Failed to cancel job"
+      );
+    }
+  };
+
+  const retryJob = async (jobId: string): Promise<void> => {
+    try {
+      const response = await fetch(buildApiUrl(`/api/jobs/${jobId}/retry`), {
+        method: "POST"
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as { job?: JobRecord };
+      if (payload.job) {
+        setSelectedJobId(payload.job.job_id);
+        setStatus(`Queued retry ${payload.job.job_id}`);
+      } else {
+        setStatus("Queued retry");
+      }
+      await loadJobs();
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? `Failed to retry job: ${error.message}`
+          : "Failed to retry job"
       );
     }
   };
@@ -1256,62 +1475,82 @@ export default function App(): JSX.Element {
           <div className="drop-overlay">Drop image here</div>
         ) : null}
 
-        <div className="app-layout">
-          <aside className="control-panel">
-            <div className="panel-title">Track Builder Controls</div>
-            <div className="status">
-              {isRecording
-                ? `Recording... ${currentFrame + 1}/${FRAME_COUNT}`
-                : status}
-            </div>
+        <div className="workspace-tabs" role="tablist" aria-label="Track builder workspace">
+          <button
+            type="button"
+            className={activeWorkspaceTab === "builder" ? "workspace-tab active" : "workspace-tab"}
+            onClick={() => setActiveWorkspaceTab("builder")}
+          >
+            Builder
+            {activeJobCount > 0 ? <span>{activeJobCount}</span> : null}
+          </button>
+          <button
+            type="button"
+            className={activeWorkspaceTab === "archive" ? "workspace-tab active" : "workspace-tab"}
+            onClick={() => setActiveWorkspaceTab("archive")}
+          >
+            Archive
+            {archiveJobCount > 0 ? <span>{archiveJobCount}</span> : null}
+          </button>
+        </div>
 
-            <section className="control-section">
-              <h3>1) Input</h3>
-              <div className="control-row">
-                <label className="btn">
-                  Load Image
-                  <input type="file" accept="image/*" onChange={onImageUpload} hidden />
-                </label>
-                <label className="btn">
-                  Import JSON
-                  <input type="file" accept="application/json" onChange={importJson} hidden />
-                </label>
-                <button type="button" onClick={exportJson}>Export JSON</button>
-                <button type="button" onClick={() => void exportTrackPackage()}>
-                  Export Track Package
-                </button>
+        {activeWorkspaceTab === "builder" ? (
+          <div className="app-layout">
+            <aside className="control-panel">
+              <div className="panel-title">Track Builder Controls</div>
+              <div className="status">
+                {isRecording
+                  ? `Recording... ${currentFrame + 1}/${FRAME_COUNT}`
+                  : status}
               </div>
-              <label className="slider-field">
-                Server Export Directory
-                <input
-                  type="text"
-                  value={serverExportPath}
-                  onChange={(event) => setServerExportPath(event.target.value)}
-                  placeholder="/path/to/root/dir (empty = local only)"
-                />
-              </label>
-              <label className="slider-field">
-                Export Subdirectory Name
-                <input
-                  type="text"
-                  value={serverExportSubDir}
-                  onChange={(event) => setServerExportSubDir(event.target.value)}
-                  placeholder="e.g. scene_001 (empty = auto timestamp)"
-                />
-              </label>
-              <div className="control-row">
-                <label>
+
+              <section className="control-section">
+                <h3>1) Input</h3>
+                <div className="control-row">
+                  <label className="btn">
+                    Load Image
+                    <input type="file" accept="image/*" onChange={onImageUpload} hidden />
+                  </label>
+                  <label className="btn">
+                    Import JSON
+                    <input type="file" accept="application/json" onChange={importJson} hidden />
+                  </label>
+                  <button type="button" onClick={exportJson}>Export JSON</button>
+                  <button type="button" onClick={() => void exportTrackPackage()}>
+                    Export Track Package
+                  </button>
+                </div>
+                <label className="slider-field">
+                  Server Export Directory
                   <input
-                    type="checkbox"
-                    checked={localDownload}
-                    onChange={(event) => setLocalDownload(event.target.checked)}
+                    type="text"
+                    value={serverExportPath}
+                    onChange={(event) => setServerExportPath(event.target.value)}
+                    placeholder="/path/to/root/dir (empty = local only)"
                   />
-                  {" "}Also download locally
                 </label>
-              </div>
-              <div className="path-info">
-                Image: {image ? `${image.width}x${image.height}` : "None"}
-              </div>
+                <label className="slider-field">
+                  Export Subdirectory Name
+                  <input
+                    type="text"
+                    value={serverExportSubDir}
+                    onChange={(event) => setServerExportSubDir(event.target.value)}
+                    placeholder="e.g. scene_001 (empty = auto timestamp)"
+                  />
+                </label>
+                <div className="control-row">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={localDownload}
+                      onChange={(event) => setLocalDownload(event.target.checked)}
+                    />
+                    {" "}Also download locally
+                  </label>
+                </div>
+                <div className="path-info">
+                  Image: {image ? `${image.width}x${image.height}` : "None"}
+                </div>
               {/* <label className="slider-field">
                 Florence Task Prompt
                 <input
@@ -1340,10 +1579,10 @@ export default function App(): JSX.Element {
                   rows={4}
                 />
               </label> */}
-            </section>
+              </section>
 
-            <section className="control-section">
-              <h3>2) Point Cloud</h3>
+              <section className="control-section">
+                <h3>2) Point Cloud</h3>
               <div className="control-row">
                 <label>
                   Shape
@@ -1464,10 +1703,10 @@ export default function App(): JSX.Element {
                   disabled={!selectedPathId || isRecording}
                 />
               </label>
-            </section>
+              </section>
 
-            <section className="control-section">
-              <h3>3) Recording</h3>
+              <section className="control-section">
+                <h3>3) Recording</h3>
               <button
                 type="button"
                 className={isRecording ? "recording-button recording primary" : "recording-button primary"}
@@ -1496,44 +1735,79 @@ export default function App(): JSX.Element {
               <div className="control-row">
                 <button type="button" onClick={() => setCurrentFrame(0)}>Reset to Frame 1</button>
               </div>
-            </section>
+              </section>
 
-            <section className="control-section danger">
-              <h3>4) Cleanup</h3>
-              <button type="button" onClick={deleteSelectedPath} disabled={!selectedPathId}>
-                Delete Selected Path
-              </button>
-            </section>
+              <GenerationControls
+                mode={generationMode}
+                prompt={generationPrompt}
+                seed={generationSeed}
+                textGuidanceWeight={textGuidanceWeight}
+                motionGuidanceWeight={motionGuidanceWeight}
+                isQueueing={isQueueing}
+                canSubmit={canAddToQueue}
+                onModeChange={handleGenerationModeChange}
+                onPromptChange={setGenerationPrompt}
+                onSeedChange={setGenerationSeed}
+                onTextGuidanceWeightChange={setTextGuidanceWeight}
+                onMotionGuidanceWeightChange={setMotionGuidanceWeight}
+                onAddToQueue={() => void addCurrentToQueue()}
+              />
 
-            <div className="path-info">
-              Selected: {selectedPath ? `${selectedPath.name} / ${selectedTrackMode}` : "None"} (
-              {selectedDisplayPath?.points.length ?? 0} pts @ frame {currentFrame + 1})
-              {" "}Total: {paths.length} tracks / {totalPointCount} pts
+              <section className="control-section danger">
+                <h3>5) Cleanup</h3>
+                <button type="button" onClick={deleteSelectedPath} disabled={!selectedPathId}>
+                  Delete Selected Path
+                </button>
+              </section>
+
+              <div className="path-info">
+                Selected: {selectedPath ? `${selectedPath.name} / ${selectedTrackMode}` : "None"} (
+                {selectedDisplayPath?.points.length ?? 0} pts @ frame {currentFrame + 1})
+                {" "}Total: {paths.length} tracks / {totalPointCount} pts
+              </div>
+            </aside>
+
+            <div className="canvas-stage">
+              <TrackCanvas
+                image={image}
+                grid={{ ...grid, visible: false }}
+                paths={displayPaths}
+                selectedPathId={selectedPathId}
+                onMovePathPoints={handlePathDrag}
+                onRecordTick={handleRecordTick}
+                onSelectPath={setSelectedPathId}
+                onDragComplete={() => undefined}
+              />
             </div>
-          </aside>
 
-          <div className="canvas-stage">
-            <TrackCanvas
-              image={image}
-              grid={{ ...grid, visible: false }}
-              paths={displayPaths}
-              selectedPathId={selectedPathId}
-              onMovePathPoints={handlePathDrag}
-              onRecordTick={handleRecordTick}
-              onSelectPath={setSelectedPathId}
-              onDragComplete={() => undefined}
+            <aside className="preview-stage">
+              <TrackPreview
+                image={image}
+                path={selectedPath}
+                frameCount={FRAME_COUNT}
+                currentFrame={currentFrame}
+              />
+              <QueuePanel
+                jobs={jobs}
+                selectedJobId={selectedJobId}
+                selectedLog={selectedJobLog}
+                onSelectJob={setSelectedJobId}
+                onRefresh={() => void loadJobs()}
+                onCancel={(jobId) => void cancelJob(jobId)}
+                onRetry={(jobId) => void retryJob(jobId)}
+                buildFileUrl={buildJobFileUrl}
+              />
+            </aside>
+          </div>
+        ) : (
+          <div className="archive-workspace">
+            <ArchivePanel
+              jobs={jobs}
+              onRetry={(jobId) => void retryJob(jobId)}
+              buildFileUrl={buildJobFileUrl}
             />
           </div>
-
-          <aside className="preview-stage">
-            <TrackPreview
-              image={image}
-              path={selectedPath}
-              frameCount={FRAME_COUNT}
-              currentFrame={currentFrame}
-            />
-          </aside>
-        </div>
+        )}
       </main>
     </div>
   );

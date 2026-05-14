@@ -43,6 +43,7 @@ export TRACK_LATENT_REST_FRAME_SCALE_TRACK="${TRACK_LATENT_REST_FRAME_SCALE_TRAC
 export ADD_TRACK_INIT_NOISE_TRACK="${ADD_TRACK_INIT_NOISE_TRACK:-false}"
 export TRACK_INIT_NOISE_SCALE_TRACK="${TRACK_INIT_NOISE_SCALE_TRACK:-0.01}"
 export TRACK_HEAD_HIDDEN_DIM_TRACK="${TRACK_HEAD_HIDDEN_DIM_TRACK:-}"
+export WAN_MOVE_PACKTIME_HIDDEN_DIM_TRACK="${WAN_MOVE_PACKTIME_HIDDEN_DIM_TRACK:-}"
 export FIRST_FRAME_CONDITION_DROP_PROB_TRACK="${FIRST_FRAME_CONDITION_DROP_PROB_TRACK:-0.0}"
 export VAL_DATA_META_NAME_TRACK="${VAL_DATA_META_NAME_TRACK:-}"
 export VAL_DATASET_NAME_TRACK="${VAL_DATASET_NAME_TRACK:-}"
@@ -149,6 +150,9 @@ fi
 if [[ -n "${TRACK_HEAD_HIDDEN_DIM_TRACK}" ]]; then
   EXTRA_ARGS_TRACK+=("--track_head_hidden_dim=${TRACK_HEAD_HIDDEN_DIM_TRACK}")
 fi
+if [[ -n "${WAN_MOVE_PACKTIME_HIDDEN_DIM_TRACK}" ]]; then
+  EXTRA_ARGS_TRACK+=("--wan_move_packtime_hidden_dim=${WAN_MOVE_PACKTIME_HIDDEN_DIM_TRACK}")
+fi
 if [[ -n "${TRAIN_BATCH_SIZE_TRACK}" ]]; then
   EXTRA_ARGS_TRACK+=("--train_batch_size=${TRAIN_BATCH_SIZE_TRACK}")
 fi
@@ -201,6 +205,7 @@ fi
   echo "add_track_init_noise=${ADD_TRACK_INIT_NOISE_TRACK}"
   echo "track_init_noise_scale=${TRACK_INIT_NOISE_SCALE_TRACK}"
   echo "track_head_hidden_dim=${TRACK_HEAD_HIDDEN_DIM_TRACK}"
+  echo "wan_move_packtime_hidden_dim=${WAN_MOVE_PACKTIME_HIDDEN_DIM_TRACK:-<4*latent_channels>}"
   echo "first_frame_condition_drop_prob=${FIRST_FRAME_CONDITION_DROP_PROB_TRACK}"
   echo "validation_steps=${VALIDATION_STEPS_TRACK}"
   echo "validation_max_batches=${VALIDATION_MAX_BATCHES_TRACK}"

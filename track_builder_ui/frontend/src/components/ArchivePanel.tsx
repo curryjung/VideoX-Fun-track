@@ -4,6 +4,7 @@ import type { JobRecord } from "../types";
 type ArchivePanelProps = {
   jobs: JobRecord[];
   onRetry: (jobId: string) => void;
+  onDelete: (jobId: string) => void;
   buildFileUrl: (job: JobRecord, relPath: string) => string;
 };
 
@@ -25,9 +26,14 @@ function formatTime(value?: string | null): string {
   return date.toLocaleString();
 }
 
+function scaleLabel(job: JobRecord): string {
+  return `f${job.track_latent_first_frame_scale} / r${job.track_latent_rest_frame_scale}`;
+}
+
 export default function ArchivePanel({
   jobs,
   onRetry,
+  onDelete,
   buildFileUrl
 }: ArchivePanelProps): JSX.Element {
   const archiveJobs = jobs.filter((job) =>
@@ -93,7 +99,9 @@ export default function ArchivePanel({
                     <span>{modeLabel(job.mode)}</span>
                     <span className={`status-pill ${job.status}`}>{job.status}</span>
                   </div>
-                  <div className="path-info">{formatTime(job.finished_at ?? job.created_at)}</div>
+                  <div className="path-info">
+                    {formatTime(job.finished_at ?? job.created_at)} / seed {job.seed} / scale {scaleLabel(job)}
+                  </div>
                   <div className="archive-prompt">{job.prompt || "a video"}</div>
                   {job.error_message ? (
                     <div className="error-text">{job.error_message}</div>
@@ -101,6 +109,13 @@ export default function ArchivePanel({
                   <div className="control-row">
                     <button type="button" onClick={() => onRetry(job.job_id)}>
                       Re-run
+                    </button>
+                    <button
+                      type="button"
+                      className="danger-button"
+                      onClick={() => onDelete(job.job_id)}
+                    >
+                      Delete
                     </button>
                     {videoPath ? (
                       <a

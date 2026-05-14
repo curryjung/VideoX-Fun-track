@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -46,6 +47,8 @@ def _str2bool(value: str) -> bool:
 
 
 def _is_new_track_layer_param(name: str, track_condition_mode: str = "track_head") -> bool:
+    if track_condition_mode == "wan_move_packtime":
+        return "wan_move_packtime_adapter" in name
     if track_condition_mode != "track_head":
         return False
     return ("track_head" in name) or name.startswith("patch_embedding.")
@@ -56,6 +59,38 @@ def _extract_block_index(name: str) -> Optional[int]:
     if m is None:
         return None
     return int(m.group(1))
+
+
+class WanMovePacktimeResidualAdapter(nn.Module):
+    def __init__(self, channels: int, hidden_dim: int) -> None:
+        super().__init__()
+        channels_i = int(channels)
+        hidden_dim_i = int(hidden_dim)
+        if channels_i <= 0:
+            raise ValueError(f"channels must be > 0, got {channels}")
+        if hidden_dim_i <= 0:
+            raise ValueError(f"hidden_dim must be > 0, got {hidden_dim}")
+
+        self.channels = channels_i
+        self.hidden_dim = hidden_dim_i
+        self.net = nn.Sequential(
+            nn.Conv3d(3 * channels_i, hidden_dim_i, kernel_size=1, stride=1),
+            nn.SiLU(),
+            nn.Conv3d(hidden_dim_i, channels_i, kernel_size=1, stride=1),
+        )
+        nn.init.zeros_(self.net[2].weight)
+        if self.net[2].bias is not None:
+            nn.init.zeros_(self.net[2].bias)
+
+    def forward(self, packed: torch.Tensor) -> torch.Tensor:
+        if packed.ndim != 5:
+            raise ValueError(f"packed must be [B,3C,F,H,W], got {tuple(packed.shape)}")
+        expected_channels = 3 * self.channels
+        if int(packed.shape[1]) != expected_channels:
+            raise ValueError(
+                f"packed channel mismatch: got {packed.shape[1]}, expected {expected_channels}"
+            )
+        return self.net(packed)
 
 
 def parse_args() -> argparse.Namespace:
@@ -323,11 +358,13 @@ def parse_args() -> argparse.Namespace:
         "--track_condition_mode",
         type=str,
         default="track_head",
-        choices=["track_head", "wan_move"],
+        choices=["track_head", "wan_move", "wan_move_packtime"],
         help=(
             "track_head keeps the existing learned track_head/extra-channel concat path. "
             "wan_move keeps the base Wan transformer and injects motion by copying first-frame "
-            "VAE features along tracks inside the inpaint y condition."
+            "VAE features along tracks inside the inpaint y condition. "
+            "wan_move_packtime keeps the same skip path and adds a zero-init residual adapter "
+            "over intra-pack temporal differences."
         ),
     )
     parser.add_argument(
@@ -411,6 +448,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Override track head hidden dim (Conv3D bottleneck width). "
             "Defaults to checkpoint/config value when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--wan_move_packtime_hidden_dim",
+        type=int,
+        default=None,
+        help=(
+            "Hidden dim for wan_move_packtime residual adapter. "
+            "Defaults to 4 * VAE latent channels when omitted."
         ),
     )
     parser.add_argument("--track_condition_key", type=str, default="track_condition")
@@ -899,6 +945,64 @@ def _empty_wan_move_condition_stats(enabled: bool = False) -> Dict[str, float]:
     }
 
 
+def _empty_wan_move_packtime_condition_stats(enabled: bool = False) -> Dict[str, float]:
+    stats = _empty_wan_move_condition_stats(enabled=enabled)
+    stats.update(
+        {
+            "wan_move_packtime/enabled": float(enabled),
+            "adapter/diff_pack_rms": 0.0,
+            "adapter/baseline_rms": 0.0,
+            "adapter/residual_rms": 0.0,
+            "adapter/residual_over_baseline_rms": 0.0,
+            "adapter/residual_l2": 0.0,
+            "adapter/baseline_l2": 0.0,
+            "adapter/residual_over_baseline_l2": 0.0,
+            "adapter/residual_batch_ratio_mean": 0.0,
+            "adapter/residual_batch_ratio_std": 0.0,
+            "adapter/residual_batch_ratio_max": 0.0,
+            "wan_move_packtime/residual_abs_max": 0.0,
+            "wan_move_packtime/output_baseline_diff_abs_max": 0.0,
+            "wan_move_packtime/legacy_baseline_diff_abs_max": 0.0,
+            "wan_move_packtime/sanity_checked": 0.0,
+        }
+    )
+    return stats
+
+
+def _tensor_l2_float(value: torch.Tensor) -> float:
+    return float(value.detach().float().norm().item())
+
+
+def _tensor_rms_float(value: torch.Tensor) -> float:
+    value_f = value.detach().float()
+    return float(torch.sqrt(torch.mean(value_f * value_f)).item())
+
+
+def _grad_l2_float(param: Optional[torch.nn.Parameter]) -> float:
+    if param is None or param.grad is None:
+        return 0.0
+    return _tensor_l2_float(param.grad)
+
+
+def _collect_wan_move_packtime_adapter_param_stats(
+    adapter: Optional[nn.Module],
+    include_weights: bool = True,
+    include_grads: bool = True,
+) -> Dict[str, float]:
+    if adapter is None or not hasattr(adapter, "net"):
+        return {}
+    conv1 = adapter.net[0]
+    conv2 = adapter.net[2]
+    stats: Dict[str, float] = {}
+    if include_weights:
+        stats["adapter/conv1_weight_l2"] = _tensor_l2_float(conv1.weight)
+        stats["adapter/conv2_weight_l2"] = _tensor_l2_float(conv2.weight)
+    if include_grads:
+        stats["adapter/conv1_grad_l2"] = _grad_l2_float(conv1.weight)
+        stats["adapter/conv2_grad_l2"] = _grad_l2_float(conv2.weight)
+    return stats
+
+
 def _as_batched_bool_hint(
     value,
     batch_size: int,
@@ -1069,6 +1173,220 @@ def _apply_wan_move_feature_replace(
     stats["wan_move_condition/copied_sites"] = float(copied)
     stats["wan_move_condition/copied_site_ratio"] = float(copied) / float(max(valid_target_sites, 1))
     return edited, stats
+
+
+def _build_wan_move_packtime_packed_condition(
+    condition_latents: torch.Tensor,
+    track_condition: Optional[Dict[str, torch.Tensor]],
+    temporal_stride: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    stats = _empty_wan_move_packtime_condition_stats(enabled=True)
+    if condition_latents.ndim != 5:
+        raise ValueError(f"condition_latents must be [B,C,F,H,W], got {tuple(condition_latents.shape)}")
+
+    device = condition_latents.device
+    bsz, channels, latent_frames, h_lat, w_lat = condition_latents.shape
+    stride = max(1, int(temporal_stride))
+    if stride != 4:
+        raise ValueError(
+            "wan_move_packtime currently expects Wan VAE temporal_compression_ratio=4, "
+            f"got {temporal_stride}."
+        )
+
+    packed_slots = (
+        condition_latents.permute(0, 2, 3, 4, 1)
+        .unsqueeze(1)
+        .expand(-1, 4, -1, -1, -1, -1)
+        .clone()
+        .contiguous()
+    )  # [B,4,F,H,W,C]
+
+    def _finish_packed() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+        packed = packed_slots.permute(0, 1, 5, 2, 3, 4).contiguous().view(
+            bsz,
+            4 * channels,
+            latent_frames,
+            h_lat,
+            w_lat,
+        )
+        baseline = packed[:, 3 * channels : 4 * channels]
+        return packed, baseline, stats
+
+    if track_condition is None:
+        return _finish_packed()
+
+    tracks = track_condition.get("tracks", None)
+    visibility = track_condition.get("visibility", None)
+    if tracks is None or visibility is None:
+        return _finish_packed()
+
+    tracks = tracks.to(device=device, dtype=torch.float32)
+    visibility = visibility.to(device=device, dtype=torch.float32)
+    if tracks.ndim != 4 or tracks.shape[-1] != 2:
+        raise ValueError(f"tracks must be [B,T,P,2], got {tuple(tracks.shape)}")
+    if visibility.ndim != 3:
+        raise ValueError(f"visibility must be [B,T,P], got {tuple(visibility.shape)}")
+    if tracks.shape[0] != bsz:
+        raise ValueError(f"Batch mismatch between condition latents ({bsz}) and tracks ({tracks.shape[0]}).")
+    if visibility.shape[:3] != tracks.shape[:3]:
+        raise ValueError(
+            "tracks/visibility shape mismatch: "
+            f"tracks={tuple(tracks.shape)} visibility={tuple(visibility.shape)}"
+        )
+    if int(tracks.shape[1]) <= 0 or latent_frames <= 1:
+        return _finish_packed()
+
+    point_mask = track_condition.get("point_mask", None)
+    if point_mask is None:
+        point_mask = torch.ones((bsz, tracks.shape[2]), device=device, dtype=torch.bool)
+    else:
+        point_mask = point_mask.to(device=device, dtype=torch.bool)
+        if point_mask.shape != (bsz, tracks.shape[2]):
+            raise ValueError(f"point_mask must be [B,P], got {tuple(point_mask.shape)}")
+
+    slot_frame_idx = torch.zeros((latent_frames, 4), device=device, dtype=torch.long)
+    if latent_frames > 1:
+        latent_idx = torch.arange(1, latent_frames, device=device, dtype=torch.long).view(-1, 1)
+        slot_offsets = torch.arange(4, device=device, dtype=torch.long).view(1, -1)
+        slot_frame_idx[1:] = (latent_idx - 1) * stride + 1 + slot_offsets
+    slot_frame_idx = torch.clamp(slot_frame_idx, max=max(int(tracks.shape[1]) - 1, 0))
+    flat_frame_idx = slot_frame_idx.reshape(-1)
+
+    sampled_tracks_flat = tracks.index_select(1, flat_frame_idx)
+    sampled_visibility = (visibility.index_select(1, flat_frame_idx) > 0.5).view(
+        bsz,
+        latent_frames,
+        4,
+        tracks.shape[2],
+    )
+    grid_xy_flat = _map_wan_move_tracks_to_latent_grid(
+        sampled_tracks_flat,
+        h_lat=h_lat,
+        w_lat=w_lat,
+        is_normalized_hint=track_condition.get("is_normalized", None),
+        track_resolution=track_condition.get("track_resolution", None),
+    )
+    grid_xy = grid_xy_flat.view(bsz, latent_frames, 4, tracks.shape[2], 2)
+    gx = grid_xy[..., 0]
+    gy = grid_xy[..., 1]
+    in_bound = (gx >= 0) & (gx < w_lat) & (gy >= 0) & (gy < h_lat)
+    valid = sampled_visibility & in_bound & point_mask[:, None, None, :]
+
+    source_valid = valid[:, 0, 3, :]
+    target_valid = (valid & source_valid[:, None, None, :]).clone()
+    target_valid[:, 0, :, :] = False
+
+    valid_indices = target_valid.nonzero(as_tuple=False)
+    valid_source_points = int(source_valid.sum().item())
+    valid_target_sites = int(target_valid.sum().item())
+    stats["wan_move_condition/valid_source_points"] = float(valid_source_points)
+    stats["wan_move_condition/valid_target_sites"] = float(valid_target_sites)
+    if valid_indices.numel() == 0:
+        return _finish_packed()
+
+    batch_idx = valid_indices[:, 0]
+    latent_idx = valid_indices[:, 1]
+    slot_idx = valid_indices[:, 2]
+    point_idx = valid_indices[:, 3]
+
+    h_target = gy[batch_idx, latent_idx, slot_idx, point_idx].long()
+    w_target = gx[batch_idx, latent_idx, slot_idx, point_idx].long()
+    h_source = gy[batch_idx, 0, 3, point_idx].long()
+    w_source = gx[batch_idx, 0, 3, point_idx].long()
+
+    src_features = condition_latents[batch_idx, :, 0, h_source, w_source]
+    packed_flat = packed_slots.reshape(-1, channels)
+    linear_idx = (
+        ((((batch_idx * 4 + slot_idx) * latent_frames + latent_idx) * h_lat + h_target) * w_lat)
+        + w_target
+    )
+    packed_flat[linear_idx] = src_features
+
+    copied = int(valid_indices.shape[0])
+    stats["wan_move_condition/copied_sites"] = float(copied)
+    stats["wan_move_condition/copied_site_ratio"] = float(copied) / float(max(valid_target_sites, 1))
+    return _finish_packed()
+
+
+def _apply_wan_move_packtime_feature_replace(
+    condition_latents: torch.Tensor,
+    track_condition: Optional[Dict[str, torch.Tensor]],
+    temporal_stride: int,
+    residual_adapter: nn.Module,
+    sanity_check: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    packed, baseline, stats = _build_wan_move_packtime_packed_condition(
+        condition_latents,
+        track_condition,
+        temporal_stride=temporal_stride,
+    )
+    bsz, _, latent_frames, h_lat, w_lat = baseline.shape
+    channels = int(baseline.shape[1])
+    slots = packed.view(bsz, 4, channels, latent_frames, h_lat, w_lat)
+    # One-based Wan pack slots 1..3 are the intra-chunk frames before the representative slot 4.
+    diff_pack = torch.cat(
+        [
+            slots[:, 0] - baseline,
+            slots[:, 1] - baseline,
+            slots[:, 2] - baseline,
+        ],
+        dim=1,
+    )
+    residual = residual_adapter(diff_pack)
+    output = baseline + residual
+
+    eps = 1e-12
+    diff_pack_rms = _tensor_rms_float(diff_pack)
+    baseline_rms = _tensor_rms_float(baseline)
+    residual_rms = _tensor_rms_float(residual)
+    residual_l2 = _tensor_l2_float(residual)
+    baseline_l2 = _tensor_l2_float(baseline)
+    residual_batch_l2 = residual.detach().float().flatten(1).norm(dim=1)
+    baseline_batch_l2 = baseline.detach().float().flatten(1).norm(dim=1)
+    batch_ratio = residual_batch_l2 / (baseline_batch_l2 + eps)
+    residual_abs_max = float(residual.detach().float().abs().max().item())
+    output_diff_abs_max = float((output.detach().float() - baseline.detach().float()).abs().max().item())
+    stats["adapter/diff_pack_rms"] = diff_pack_rms
+    stats["adapter/baseline_rms"] = baseline_rms
+    stats["adapter/residual_rms"] = residual_rms
+    stats["adapter/residual_over_baseline_rms"] = residual_rms / (baseline_rms + eps)
+    stats["adapter/residual_l2"] = residual_l2
+    stats["adapter/baseline_l2"] = baseline_l2
+    stats["adapter/residual_over_baseline_l2"] = residual_l2 / (baseline_l2 + eps)
+    stats["adapter/residual_batch_ratio_mean"] = float(batch_ratio.mean().item())
+    stats["adapter/residual_batch_ratio_std"] = float(batch_ratio.std(unbiased=False).item())
+    stats["adapter/residual_batch_ratio_max"] = float(batch_ratio.max().item())
+    stats["wan_move_packtime/residual_abs_max"] = residual_abs_max
+    stats["wan_move_packtime/output_baseline_diff_abs_max"] = output_diff_abs_max
+
+    if sanity_check:
+        legacy_baseline, _ = _apply_wan_move_feature_replace(
+            condition_latents,
+            track_condition,
+            temporal_stride=temporal_stride,
+        )
+        legacy_diff_abs_max = float(
+            (baseline.detach().float() - legacy_baseline.detach().float()).abs().max().item()
+        )
+        stats["wan_move_packtime/legacy_baseline_diff_abs_max"] = legacy_diff_abs_max
+        stats["wan_move_packtime/sanity_checked"] = 1.0
+        if residual_abs_max != 0.0:
+            raise RuntimeError(
+                "wan_move_packtime zero-init sanity check failed: "
+                f"residual_abs_max={residual_abs_max:.6e}"
+            )
+        if output_diff_abs_max != 0.0:
+            raise RuntimeError(
+                "wan_move_packtime zero-init sanity check failed: "
+                f"output_baseline_diff_abs_max={output_diff_abs_max:.6e}"
+            )
+        if legacy_diff_abs_max != 0.0:
+            raise RuntimeError(
+                "wan_move_packtime baseline sanity check failed: "
+                f"legacy_baseline_diff_abs_max={legacy_diff_abs_max:.6e}"
+            )
+
+    return output, stats
 
 
 def _forward_transformer_with_track_mode(
@@ -2310,16 +2628,21 @@ def main() -> None:
             args.track_condition_mode,
         )
     is_latent_mode = args.input_mode_track == "latent"
-    if args.track_condition_mode == "wan_move":
+    if args.track_condition_mode in {"wan_move", "wan_move_packtime"}:
         if not args.use_track_condition:
-            raise ValueError("--track_condition_mode=wan_move requires --use_track_condition.")
+            raise ValueError(f"--track_condition_mode={args.track_condition_mode} requires --use_track_condition.")
         if not is_latent_mode:
-            raise ValueError("--track_condition_mode=wan_move currently requires --input_mode_track=latent.")
+            raise ValueError(
+                f"--track_condition_mode={args.track_condition_mode} currently requires --input_mode_track=latent."
+            )
         if args.train_mode == "normal" or (not args.use_first_frame_condition_track):
             raise ValueError(
-                "--track_condition_mode=wan_move requires inpaint/i2v first-frame conditioning "
+                f"--track_condition_mode={args.track_condition_mode} requires inpaint/i2v first-frame conditioning "
                 "(--train_mode != normal and --use_first_frame_condition_track)."
             )
+    if args.track_condition_mode == "wan_move_packtime" and args.wan_move_packtime_hidden_dim is not None:
+        if int(args.wan_move_packtime_hidden_dim) <= 0:
+            raise ValueError("--wan_move_packtime_hidden_dim must be > 0 when provided.")
 
     project_config = ProjectConfiguration(
         project_dir=args.output_dir_track,
@@ -2393,6 +2716,34 @@ def main() -> None:
         ),
         transformer_additional_kwargs=transformer_additional_kwargs,
     ).to(weight_dtype)
+    if args.track_condition_mode == "wan_move_packtime":
+        wan_move_packtime_channels = int(
+            getattr(vae, "latent_channels", getattr(vae.config, "latent_channels", 0))
+        )
+        if wan_move_packtime_channels <= 0:
+            raise ValueError(
+                "Could not infer VAE latent channels for wan_move_packtime adapter "
+                f"(got {wan_move_packtime_channels})."
+            )
+        wan_move_packtime_hidden_dim = (
+            int(args.wan_move_packtime_hidden_dim)
+            if args.wan_move_packtime_hidden_dim is not None
+            else 4 * wan_move_packtime_channels
+        )
+        transformer3d_track.wan_move_packtime_adapter = WanMovePacktimeResidualAdapter(
+            channels=wan_move_packtime_channels,
+            hidden_dim=wan_move_packtime_hidden_dim,
+        ).to(dtype=weight_dtype)
+        if accelerator.is_main_process:
+            adapter_msg = (
+                "Wan-Move-PackTime residual adapter initialized: "
+                f"C={wan_move_packtime_channels}, "
+                f"hidden_dim={wan_move_packtime_hidden_dim}, "
+                "conv2_zero_init=true"
+            )
+            logger.info(adapter_msg)
+            accelerator.print(adapter_msg)
+    wan_move_packtime_adapter_loaded_from_init = False
     if args.init_model_from_checkpoint_track:
         init_path = _resolve_resume_checkpoint_track(
             args.init_model_from_checkpoint_track,
@@ -2400,6 +2751,18 @@ def main() -> None:
             args.checkpoint_dir_track,
         )
         load_info = _load_model_only_checkpoint_track(transformer3d_track, init_path)
+        if args.track_condition_mode == "wan_move_packtime":
+            adapter_param_names = [
+                name
+                for name, _ in transformer3d_track.named_parameters()
+                if "wan_move_packtime_adapter" in name
+            ]
+            missing_adapter_names = [
+                name for name in load_info["missing"] if "wan_move_packtime_adapter" in name
+            ]
+            wan_move_packtime_adapter_loaded_from_init = (
+                len(adapter_param_names) > 0 and len(missing_adapter_names) == 0
+            )
         if accelerator.is_main_process:
             miss_cnt = len(load_info["missing"])
             unexp_cnt = len(load_info["unexpected"])
@@ -2994,6 +3357,22 @@ def main() -> None:
         logger.info(mode_msg)
         accelerator.print(mode_msg)
 
+    def _get_wan_move_packtime_adapter() -> nn.Module:
+        adapter = getattr(
+            accelerator.unwrap_model(transformer3d_track),
+            "wan_move_packtime_adapter",
+            None,
+        )
+        if adapter is None:
+            raise RuntimeError("wan_move_packtime_adapter is missing from transformer3d_track.")
+        return adapter
+
+    wan_move_packtime_sanity_done = not (
+        args.track_condition_mode == "wan_move_packtime"
+        and not args.resume_from_checkpoint_track
+        and not wan_move_packtime_adapter_loaded_from_init
+    )
+
     ckpt_root = _checkpoint_scan_root_track(args.output_dir_track, args.checkpoint_dir_track)
     global_step = 0
     if args.resume_from_checkpoint_track:
@@ -3212,6 +3591,17 @@ def main() -> None:
                             )
                             val_y = val_y.clone()
                             val_y[:, -val_latents.shape[1] :] = val_y_track
+                        elif args.track_condition_mode == "wan_move_packtime":
+                            val_y_track = val_y[:, -val_latents.shape[1] :]
+                            val_y_track, _ = _apply_wan_move_packtime_feature_replace(
+                                val_y_track,
+                                val_track_condition,
+                                temporal_stride=wan_move_temporal_stride,
+                                residual_adapter=_get_wan_move_packtime_adapter(),
+                                sanity_check=False,
+                            )
+                            val_y = val_y.clone()
+                            val_y[:, -val_latents.shape[1] :] = val_y_track
 
                     val_noise_pred = _forward_transformer_with_track_mode(
                         transformer3d_track,
@@ -3292,6 +3682,7 @@ def main() -> None:
                 _set_trainability_phase(new_only=False)
             with accelerator.accumulate(transformer3d_track):
                 track_health_metrics = {}
+                adapter_debug_metrics = {}
                 if (
                     (not first_step_peak_memory_started)
                     and torch.cuda.is_available()
@@ -3369,9 +3760,12 @@ def main() -> None:
                     clip_fea = clip_fea.to(accelerator.device, dtype=weight_dtype)
                 y = None
                 first_frame_drop_ratio = 0.0
-                wan_move_condition_stats = _empty_wan_move_condition_stats(
-                    enabled=args.track_condition_mode == "wan_move"
-                )
+                if args.track_condition_mode == "wan_move_packtime":
+                    wan_move_condition_stats = _empty_wan_move_packtime_condition_stats(enabled=True)
+                else:
+                    wan_move_condition_stats = _empty_wan_move_condition_stats(
+                        enabled=args.track_condition_mode == "wan_move"
+                    )
                 if (
                     args.input_mode_track == "latent"
                     and args.train_mode != "normal"
@@ -3572,6 +3966,28 @@ def main() -> None:
                     )
                     y = y.clone()
                     y[:, -latents.shape[1] :] = y_track
+                elif y is not None and args.track_condition_mode == "wan_move_packtime":
+                    y_track = y[:, -latents.shape[1] :]
+                    run_packtime_sanity = not wan_move_packtime_sanity_done
+                    y_track, wan_move_condition_stats = _apply_wan_move_packtime_feature_replace(
+                        y_track,
+                        track_condition,
+                        temporal_stride=wan_move_temporal_stride,
+                        residual_adapter=_get_wan_move_packtime_adapter(),
+                        sanity_check=run_packtime_sanity,
+                    )
+                    if run_packtime_sanity:
+                        wan_move_packtime_sanity_done = True
+                        accelerator.print(
+                            "[wan-move-packtime sanity] "
+                            f"residual_abs_max={wan_move_condition_stats['wan_move_packtime/residual_abs_max']:.6e} "
+                            f"output_baseline_diff_abs_max="
+                            f"{wan_move_condition_stats['wan_move_packtime/output_baseline_diff_abs_max']:.6e} "
+                            f"legacy_baseline_diff_abs_max="
+                            f"{wan_move_condition_stats['wan_move_packtime/legacy_baseline_diff_abs_max']:.6e}"
+                        )
+                    y = y.clone()
+                    y[:, -latents.shape[1] :] = y_track
 
                 if (
                     y is not None
@@ -3686,6 +4102,14 @@ def main() -> None:
                             "track_health/patch_added_grad_abs_mean": patch_added_grad_abs_mean,
                         }
                     )
+                    if args.track_condition_mode == "wan_move_packtime":
+                        adapter_debug_metrics.update(
+                            _collect_wan_move_packtime_adapter_param_stats(
+                                getattr(unwrapped_model, "wan_move_packtime_adapter", None),
+                                include_weights=False,
+                                include_grads=True,
+                            )
+                        )
 
                 if args.debug_weight_update_track and accelerator.is_main_process:
                     grads_none = 0
@@ -3717,6 +4141,18 @@ def main() -> None:
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 optimizer.step()
+                if accelerator.sync_gradients and args.track_condition_mode == "wan_move_packtime":
+                    adapter_debug_metrics.update(
+                        _collect_wan_move_packtime_adapter_param_stats(
+                            getattr(
+                                accelerator.unwrap_model(transformer3d_track),
+                                "wan_move_packtime_adapter",
+                                None,
+                            ),
+                            include_weights=True,
+                            include_grads=False,
+                        )
+                    )
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
@@ -3826,6 +4262,18 @@ def main() -> None:
                             f"update_norm_sum={track_head_update_norm_sum:.6e}, "
                             f"rel_update_avg={track_head_rel_update_sum / track_head_update_param_count:.6e}"
                         )
+                    if args.track_condition_mode == "wan_move_packtime" and adapter_debug_metrics:
+                        accelerator.print(
+                            "[adapter-debug] "
+                            f"conv2_weight_l2={adapter_debug_metrics.get('adapter/conv2_weight_l2', 0.0):.6e}, "
+                            f"conv2_grad_l2={adapter_debug_metrics.get('adapter/conv2_grad_l2', 0.0):.6e}, "
+                            f"conv1_weight_l2={adapter_debug_metrics.get('adapter/conv1_weight_l2', 0.0):.6e}, "
+                            f"conv1_grad_l2={adapter_debug_metrics.get('adapter/conv1_grad_l2', 0.0):.6e}, "
+                            f"residual_over_baseline_rms="
+                            f"{wan_move_condition_stats.get('adapter/residual_over_baseline_rms', 0.0):.6e}, "
+                            f"residual_batch_ratio_max="
+                            f"{wan_move_condition_stats.get('adapter/residual_batch_ratio_max', 0.0):.6e}"
+                        )
 
                 if (
                     args.debug_memory_track
@@ -3908,6 +4356,7 @@ def main() -> None:
                             if key in model_track_debug:
                                 log_payload[key] = float(model_track_debug[key])
                     log_payload.update(track_health_metrics)
+                    log_payload.update(adapter_debug_metrics)
                     if args.debug_weight_update_track and accelerator.is_main_process:
                         log_payload.update(
                             {

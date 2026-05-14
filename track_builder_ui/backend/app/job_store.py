@@ -108,6 +108,8 @@ class JobStore:
         seed: int,
         text_guidance_weight: float,
         motion_guidance_weight: float,
+        track_latent_first_frame_scale: float,
+        track_latent_rest_frame_scale: float,
     ) -> JobRecord:
         job_id = make_job_id()
         job_dir = self.job_dir(job_id)
@@ -134,6 +136,8 @@ class JobStore:
             seed=int(seed),
             text_guidance_weight=float(text_guidance_weight),
             motion_guidance_weight=float(motion_guidance_weight),
+            track_latent_first_frame_scale=float(track_latent_first_frame_scale),
+            track_latent_rest_frame_scale=float(track_latent_rest_frame_scale),
             created_at=now_iso(),
             input=JobInputPaths(
                 image=image_rel,
@@ -180,6 +184,8 @@ class JobStore:
             seed=source.seed,
             text_guidance_weight=source.text_guidance_weight,
             motion_guidance_weight=source.motion_guidance_weight,
+            track_latent_first_frame_scale=source.track_latent_first_frame_scale,
+            track_latent_rest_frame_scale=source.track_latent_rest_frame_scale,
             created_at=now_iso(),
             input=JobInputPaths(
                 image=image_rel,
@@ -244,6 +250,16 @@ class JobStore:
         job.error_message = message
         job.outputs = self.discover_outputs(job_id)
         return self.save_job(job)
+
+    def delete_archived_job(self, job_id: str) -> None:
+        with self._lock:
+            job = self.read_job(job_id)
+            if job.status not in ARCHIVE_STATUSES:
+                raise ValueError("Only archived jobs can be deleted.")
+            job_dir = self.job_dir(job_id)
+            if not job_dir.exists():
+                raise FileNotFoundError(f"Job not found: {job_id}")
+            shutil.rmtree(job_dir)
 
     def recover_after_restart(self) -> None:
         for job in self.list_jobs():

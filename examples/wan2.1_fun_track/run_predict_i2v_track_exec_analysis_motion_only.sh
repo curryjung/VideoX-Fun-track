@@ -19,7 +19,7 @@ TRACK_LATENT_SCALE_LIST=(1.0)
 # Optional split scale. Leave empty to use TRACK_LATENT_SCALE for both.
 # Example: TRACK_LATENT_FIRST_FRAME_SCALE=1.0, TRACK_LATENT_REST_FRAME_SCALE=4.0
 TRACK_LATENT_FIRST_FRAME_SCALE="${TRACK_LATENT_FIRST_FRAME_SCALE:-0.5}"
-TRACK_LATENT_REST_FRAME_SCALE="${TRACK_LATENT_REST_FRAME_SCALE:-2.0}"
+TRACK_LATENT_REST_FRAME_SCALE="${TRACK_LATENT_REST_FRAME_SCALE:-1.8}"
 SEED_LIST=(42 41)
 # SEED_LIST=(39 38 37 36 35 34 33 32)
 # SEED_LIST=(42 41 40)
@@ -32,12 +32,10 @@ ckpt_list=(1700)
 ckpt_list=(1800 2300 2800)
 ckpt_list=(2800 2300 1800)
 ckpt_list=(4200 3800 3400 3000 2600 2200 1800 1400 1000 600 200)
-ckpt_list=(5600)
-ckpt_list=(200 400 600 800 1000 1200 1400 1600 1800)
-ckpt_list=(1400 1200 1000 800 600 400 200)
-ckpt_list=(1600)
-ckpt_list=(9400)
-ckpt_list=(1000)
+ckpt_list=(1600 1200 800 400)
+ckpt_list=(3200 2800 2400 2000 1600 1200 800 400)
+ckpt_list=(3400)
+# ckpt_list=(15000 14000 13000 12000 11000 10000)
 # /data/project-vilab/jaeseok/VideoX-Fun/checkpoints/wan_track_track-patch-embed-init-track_bs16_alpha_1p0_init_noise_0p01_bin8_train_78k_h_dim_64_dropout_first-frame_0p1_text_0p1_track_0p1/checkpoint-2800
 # EXP_NAME="wan_track_track-patch-embed-init-track-alpha_1p0_init_noise_0p01_selected64_h_dim_256_dropout_first-frame_0p1_text_0p1_track_0p1"
 EXP_NAME="wan_track_track-patch-embed-init-track_bs16_alpha_1p0_init_noise_0p01_selected64_h_dim_64_dropout_first-frame_0p1_text_0p1_track_0p1"
@@ -49,17 +47,23 @@ EXP_NAME="wan_track_track-patch-embed-init-track_local-point-id-mode_bs64_alpha_
 # EXP_NAME="wan_track_track-patch-embed-init-track_local-point-id-mode_bs64_alpha_1p0_init_noise_0p01_bin8_train_78k_h_dim_256_dropout_first-frame_0p1_text_0p1_track_0p1"
 # EXP_NAME="wan_track_track-patch-embed-init-track_bs16_alpha_1p0_init_noise_0p01_bin8_train_78k_h_dim_64_dropout_first-frame_0p1_text_0p1_track_0p1"
 # EXP_NAME="wan_track_patch-copy_first_gain-1.0_scale-8.0_track_local-point-id_bs64_train_78k_h_dim_64_all-dropouts_0p1"
-EXP_NAME="wan_track_patch-copy_first_gain-1.0_scale-4.0_track_local-point-id_bs64_train_78k_h_dim_64_all-dropouts_0p1"
+# EXP_NAME="wan_track_patch-copy_first_gain-1.0_scale-4.0_track_local-point-id_bs64_train_78k_h_dim_64_all-dropouts_0p1"
+EXP_NAME="wan_track_init-from-scratch-ff-scale-0.5_rf-scale-1.8_openvid-0p6m_wisa-80k"
+# EXP_NAME="wan_track_init-proud-sea-57-ckpt1000_ff-scale-0.5_rf-scale-1.8_openvid-0p6m_wisa-80k"
+# EXP_NAME="wan_track_init-proud-sea-57-ckpt10000_ff-scale-0.5_rf-scale-1.8_openvid-0p6m_wisa-80k"
+
 CHECKPOINT_BASE_DIR="/data/project-vilab/jaeseok/VideoX-Fun/checkpoints"
 SAVE_BASE_DIR_BASE="/data/project-vilab/jaeseok/VideoX-Fun/samples/wan-videos-fun-i2v-track"
 
 GUIDANCE_MODE="${GUIDANCE_MODE:-motion_only}"
-TEXT_GUIDANCE_WEIGHT="${TEXT_GUIDANCE_WEIGHT:-0.0}"
+TEXT_GUIDANCE_WEIGHT="${TEXT_GUIDANCE_WEIGHT:-1.5}"
 MOTION_GUIDANCE_WEIGHT="${MOTION_GUIDANCE_WEIGHT:-3.0}"
 TRACK_NORMALIZE="${TRACK_NORMALIZE:-true}"
 TRACK_NORMALIZE_HEIGHT="${TRACK_NORMALIZE_HEIGHT:-480}"
 TRACK_NORMALIZE_WIDTH="${TRACK_NORMALIZE_WIDTH:-832}"
 TRACK_HEAD_HIDDEN_DIM="${TRACK_HEAD_HIDDEN_DIM:-64}"
+TRACK_CONDITION_MODE="${TRACK_CONDITION_MODE:-track_head}"
+WAN_MOVE_TEMPORAL_STRIDE="${WAN_MOVE_TEMPORAL_STRIDE:-}"
 TRACK_MAX_POINTS="${TRACK_MAX_POINTS:-2000}"
 TRACK_POINT_SAMPLE_MODE="${TRACK_POINT_SAMPLE_MODE:-random}"
 TRACK_SORT_SELECTED_INDICES="${TRACK_SORT_SELECTED_INDICES:-false}"
@@ -100,8 +104,12 @@ for ckpt in "${ckpt_list[@]}"; do
                 if [[ "${TRACK_MAX_POINTS}" != "-1" ]]; then
                     TRACK_POINTS_SUFFIX="p${TRACK_MAX_POINTS}"
                 fi
-                OUTPUT_NAME_SUFFIX="motiononly_wt${TEXT_GUIDANCE_WEIGHT}_wm${MOTION_GUIDANCE_WEIGHT}_${TRACK_POINTS_SUFFIX}_ff${TRACK_LATENT_FIRST_FRAME_SCALE_RUN}_rf${TRACK_LATENT_REST_FRAME_SCALE_RUN}_toff${TRACK_CONDITION_INDEX_OFFSET}_seed${SEED}"
-                CUDA_VISIBLE_DEVICES=5 \
+                TRACK_CONDITION_MODE_SUFFIX=""
+                if [[ "${TRACK_CONDITION_MODE}" != "track_head" ]]; then
+                    TRACK_CONDITION_MODE_SUFFIX="_${TRACK_CONDITION_MODE}"
+                fi
+                OUTPUT_NAME_SUFFIX="motiononly_wt${TEXT_GUIDANCE_WEIGHT}_wm${MOTION_GUIDANCE_WEIGHT}_${TRACK_POINTS_SUFFIX}_ff${TRACK_LATENT_FIRST_FRAME_SCALE_RUN}_rf${TRACK_LATENT_REST_FRAME_SCALE_RUN}_toff${TRACK_CONDITION_INDEX_OFFSET}${TRACK_CONDITION_MODE_SUFFIX}_seed${SEED}"
+                CUDA_VISIBLE_DEVICES=7 \
                 TRANSFORMER_CHECKPOINT_PATH="${TRANSFORMER_CHECKPOINT_PATH}" \
                 METADATA_PATH="${VAL_METADATA_PATH}" \
                 TRAIN_DATA_DIR="${TRAIN_DATA_DIR}" \
@@ -116,6 +124,8 @@ for ckpt in "${ckpt_list[@]}"; do
                 TRACK_MAX_POINTS="${TRACK_MAX_POINTS}" \
                 TRACK_NORMALIZE="${TRACK_NORMALIZE}" \
                 TRACK_HEAD_HIDDEN_DIM="${TRACK_HEAD_HIDDEN_DIM}" \
+                TRACK_CONDITION_MODE="${TRACK_CONDITION_MODE}" \
+                WAN_MOVE_TEMPORAL_STRIDE="${WAN_MOVE_TEMPORAL_STRIDE}" \
                 TRACK_LATENT_SCALE="${TRACK_LATENT_SCALE}" \
                 TRACK_LATENT_FIRST_FRAME_SCALE="${TRACK_LATENT_FIRST_FRAME_SCALE_RUN}" \
                 TRACK_LATENT_REST_FRAME_SCALE="${TRACK_LATENT_REST_FRAME_SCALE_RUN}" \

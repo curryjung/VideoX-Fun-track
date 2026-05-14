@@ -24,7 +24,15 @@ REPO_ROOT = CURRENT_FILE.parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from track_builder_ui.backend.app.job_runner import DEFAULT_CKPT, DEFAULT_EXP_NAME  # noqa: E402
+from track_builder_ui.backend.app.job_runner import (  # noqa: E402
+    DEFAULT_CKPT,
+    DEFAULT_EXP_NAME,
+    DEFAULT_TRACK_HEAD_CKPT,
+    DEFAULT_TRACK_HEAD_EXP_NAME,
+    DEFAULT_WAN_MOVE_CKPT,
+    DEFAULT_WAN_MOVE_EXP_NAME,
+    VALID_TRACK_CONDITION_MODES,
+)
 from track_builder_ui.backend.app.job_store import JobStore  # noqa: E402
 from track_builder_ui.backend.app.schemas import JobRecord  # noqa: E402
 
@@ -44,13 +52,64 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-def _resolve_checkpoint(repo_root: Path) -> str:
+def _track_condition_mode_from_env() -> str:
+    mode = (
+        os.environ.get("TRACK_BUILDER_TRACK_CONDITION_MODE", "track_head")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    mode = mode or "track_head"
+    if mode not in VALID_TRACK_CONDITION_MODES:
+        valid_modes = ", ".join(sorted(VALID_TRACK_CONDITION_MODES))
+        raise ValueError(
+            "TRACK_BUILDER_TRACK_CONDITION_MODE must be one of "
+            f"{valid_modes}; got {mode!r}."
+        )
+    return mode
+
+
+def _checkpoint_defaults(track_condition_mode: str) -> tuple[str, str, str, str]:
+    if track_condition_mode == "wan_move":
+        return (
+            DEFAULT_WAN_MOVE_EXP_NAME,
+            DEFAULT_WAN_MOVE_CKPT,
+            "TRACK_BUILDER_WAN_MOVE_EXP_NAME",
+            "TRACK_BUILDER_WAN_MOVE_CKPT",
+        )
+    return (
+        DEFAULT_TRACK_HEAD_EXP_NAME,
+        DEFAULT_TRACK_HEAD_CKPT,
+        "TRACK_BUILDER_TRACK_HEAD_EXP_NAME",
+        "TRACK_BUILDER_TRACK_HEAD_CKPT",
+    )
+
+
+def _resolve_checkpoint(repo_root: Path, track_condition_mode: str) -> str:
     explicit = os.environ.get("TRACK_BUILDER_TRANSFORMER_CHECKPOINT_PATH", "").strip()
     if explicit:
         return explicit
-    exp_name = os.environ.get("TRACK_BUILDER_EXP_NAME", DEFAULT_EXP_NAME).strip() or DEFAULT_EXP_NAME
-    ckpt = os.environ.get("TRACK_BUILDER_CKPT", DEFAULT_CKPT).strip() or DEFAULT_CKPT
+    default_exp_name, default_ckpt, mode_exp_env, mode_ckpt_env = _checkpoint_defaults(track_condition_mode)
+    exp_name = (
+        os.environ.get("TRACK_BUILDER_EXP_NAME", "").strip()
+        or os.environ.get(mode_exp_env, "").strip()
+        or default_exp_name
+        or DEFAULT_EXP_NAME
+    )
+    ckpt = (
+        os.environ.get("TRACK_BUILDER_CKPT", "").strip()
+        or os.environ.get(mode_ckpt_env, "").strip()
+        or default_ckpt
+        or DEFAULT_CKPT
+    )
     return str(repo_root / "checkpoints" / exp_name / f"checkpoint-{ckpt}")
+
+
+def _optional_int_env(name: str, default: str) -> int | None:
+    value = os.environ.get(name, default).strip()
+    if not value:
+        return None
+    return int(value)
 
 
 def _load_predict_module(repo_root: Path) -> Any:
@@ -68,6 +127,8 @@ def _load_predict_module(repo_root: Path) -> Any:
 
 
 def parse_args() -> argparse.Namespace:
+    default_track_condition_mode = _track_condition_mode_from_env()
+    is_wan_move = default_track_condition_mode == "wan_move"
     parser = argparse.ArgumentParser(description="Experimental persistent Track Builder worker.")
     parser.add_argument(
         "--jobs_root",
@@ -93,7 +154,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--transformer_checkpoint_path",
         type=str,
-        default=_resolve_checkpoint(REPO_ROOT),
+        default="",
     )
     parser.add_argument("--mixed_precision", type=str, default=_env("TRACK_BUILDER_MIXED_PRECISION", "bf16"))
     parser.add_argument("--sampler_name", type=str, default=_env("TRACK_BUILDER_SAMPLER_NAME", "Flow"))
@@ -117,14 +178,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--track_head_hidden_dim",
         type=int,
-        default=int(_env("TRACK_BUILDER_TRACK_HEAD_HIDDEN_DIM", "64")),
+        default=_optional_int_env("TRACK_BUILDER_TRACK_HEAD_HIDDEN_DIM", "" if is_wan_move else "64"),
     )
     parser.add_argument(
         "--track_latent_scale",
         type=float,
-        default=float(_env("TRACK_BUILDER_TRACK_LATENT_SCALE", "4.0")),
+        default=float(_env("TRACK_BUILDER_TRACK_LATENT_SCALE", "1.0" if is_wan_move else "4.0")),
     )
-    parser.add_argument("--track_max_points", type=int, default=int(_env("TRACK_BUILDER_TRACK_MAX_POINTS", "2000")))
+    parser.add_argument(
+        "--track_condition_mode",
+        type=str,
+        default=default_track_condition_mode,
+        help="track_head uses the track-head checkpoint; wan_move uses the Wan-Move latent-copy adapter.",
+    )
+    parser.add_argument(
+        "--wan_move_temporal_stride",
+        type=int,
+        default=int(_env("TRACK_BUILDER_WAN_MOVE_TEMPORAL_STRIDE", "0")),
+        help="<=0 uses the VAE temporal compression ratio.",
+    )
+    parser.add_argument(
+        "--track_max_points",
+        type=int,
+        default=int(_env("TRACK_BUILDER_TRACK_MAX_POINTS", "1500" if is_wan_move else "2000")),
+    )
     parser.add_argument(
         "--track_point_sample_mode",
         type=str,
@@ -134,12 +211,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--track_sort_selected_indices",
         type=_str2bool,
-        default=_str2bool(_env("TRACK_BUILDER_TRACK_SORT_SELECTED_INDICES", "false")),
+        default=_str2bool(_env("TRACK_BUILDER_TRACK_SORT_SELECTED_INDICES", "true" if is_wan_move else "false")),
     )
     parser.add_argument(
         "--track_point_id_mode",
         type=str,
-        default=_env("TRACK_BUILDER_TRACK_POINT_ID_MODE", "local"),
+        default=_env("TRACK_BUILDER_TRACK_POINT_ID_MODE", "original" if is_wan_move else "local"),
         choices=["original", "local"],
     )
     parser.add_argument("--track_normalize", type=_str2bool, default=True)
@@ -156,7 +233,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug_track_condition", action="store_true")
     parser.add_argument("--track_analysis", action="store_true")
     parser.add_argument("--zero_clip_context", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.track_condition_mode = str(args.track_condition_mode).strip().lower().replace("-", "_")
+    if args.track_condition_mode not in VALID_TRACK_CONDITION_MODES:
+        valid_modes = ", ".join(sorted(VALID_TRACK_CONDITION_MODES))
+        raise ValueError(f"--track_condition_mode must be one of {valid_modes}; got {args.track_condition_mode!r}.")
+    if not str(args.transformer_checkpoint_path).strip():
+        args.transformer_checkpoint_path = _resolve_checkpoint(REPO_ROOT, args.track_condition_mode)
+    return args
 
 
 class TrackI2VPersistentRuntime:
@@ -188,11 +272,17 @@ class TrackI2VPersistentRuntime:
         transformer_kwargs = self.predict.OmegaConf.to_container(
             self.config["transformer_additional_kwargs"]
         )
-        if args.track_head_hidden_dim is not None:
-            transformer_kwargs["track_head_hidden_dim"] = int(args.track_head_hidden_dim)
-        transformer_kwargs["track_latent_scale"] = float(args.track_latent_scale)
+        if args.track_condition_mode == "track_head":
+            if args.track_head_hidden_dim is not None:
+                transformer_kwargs["track_head_hidden_dim"] = int(args.track_head_hidden_dim)
+            transformer_kwargs["track_latent_scale"] = float(args.track_latent_scale)
+            transformer_cls = self.predict.WanTransformer3DModelTrack
+        elif args.track_condition_mode == "wan_move":
+            transformer_cls = self.predict.WanTransformer3DModel
+        else:
+            raise ValueError(f"Unsupported track_condition_mode: {args.track_condition_mode}")
 
-        self.transformer = self.predict.WanTransformer3DModelTrack.from_pretrained(
+        self.transformer = transformer_cls.from_pretrained(
             os.path.join(
                 args.model_name,
                 self.config["transformer_additional_kwargs"].get("transformer_subpath", "transformer"),
@@ -221,6 +311,20 @@ class TrackI2VPersistentRuntime:
             os.path.join(args.model_name, self.config["vae_kwargs"].get("vae_subpath", "vae")),
             additional_kwargs=self.predict.OmegaConf.to_container(self.config["vae_kwargs"]),
         ).to(self.weight_dtype)
+        if args.track_condition_mode == "wan_move":
+            wan_move_temporal_stride = int(args.wan_move_temporal_stride)
+            if wan_move_temporal_stride <= 0:
+                wan_move_temporal_stride = int(getattr(self.vae.config, "temporal_compression_ratio", 4))
+            self.predict._attach_wan_move_forward_adapter(
+                transformer=self.transformer,
+                latent_channels=int(getattr(self.vae.config, "latent_channels", 16)),
+                temporal_stride=wan_move_temporal_stride,
+            )
+            print(
+                "[worker] wan_move adapter enabled: "
+                f"latent_channels={int(getattr(self.vae.config, 'latent_channels', 16))} "
+                f"temporal_stride={wan_move_temporal_stride}"
+            )
         self.tokenizer = self.predict.AutoTokenizer.from_pretrained(
             os.path.join(
                 args.model_name,
@@ -308,7 +412,11 @@ class TrackI2VPersistentRuntime:
             sampler_name=self.args.sampler_name,
             shift=float(self.args.shift),
             mixed_precision=self.args.mixed_precision,
-            track_head_hidden_dim=self.args.track_head_hidden_dim,
+            track_head_hidden_dim=(
+                self.args.track_head_hidden_dim if self.args.track_condition_mode == "track_head" else None
+            ),
+            track_condition_mode=self.args.track_condition_mode,
+            wan_move_temporal_stride=int(self.args.wan_move_temporal_stride),
             save_dir=str(job_dir / "outputs"),
             output_name_suffix=f"{job.mode}_seed{job.seed}_{job.job_id}",
             normalize_track=bool(self.args.track_normalize),
@@ -329,7 +437,21 @@ class TrackI2VPersistentRuntime:
             pdb_pipeline_step0=False,
             force_track_condition_none=False,
             random_fake_track=False,
-            track_latent_scale=float(self.args.track_latent_scale),
+            track_latent_scale=(
+                float(job.track_latent_rest_frame_scale)
+                if self.args.track_condition_mode == "track_head"
+                else 1.0
+            ),
+            track_latent_first_frame_scale=(
+                float(job.track_latent_first_frame_scale)
+                if self.args.track_condition_mode == "track_head"
+                else None
+            ),
+            track_latent_rest_frame_scale=(
+                float(job.track_latent_rest_frame_scale)
+                if self.args.track_condition_mode == "track_head"
+                else None
+            ),
         )
 
     def generate(self, job: JobRecord, job_dir: Path) -> None:
@@ -394,7 +516,10 @@ class TrackI2VPersistentRuntime:
             os.environ["WAN_DEBUG_TRACK_CONDITION"] = "1"
         if args.track_analysis:
             os.environ["WAN_TRACK_ANALYSIS"] = "1"
-        os.environ["WAN_TRACK_LATENT_SCALE"] = str(args.track_latent_scale)
+        if args.track_condition_mode == "track_head":
+            os.environ["WAN_TRACK_LATENT_SCALE"] = str(args.track_latent_scale)
+            os.environ["TRACK_LATENT_FIRST_FRAME_SCALE"] = str(args.track_latent_first_frame_scale)
+            os.environ["TRACK_LATENT_REST_FRAME_SCALE"] = str(args.track_latent_rest_frame_scale)
         try:
             with self.torch.no_grad():
                 sample = self.pipeline(
@@ -422,6 +547,8 @@ class TrackI2VPersistentRuntime:
             os.environ.pop("WAN_DEBUG_TRACK_CONDITION", None)
             os.environ.pop("WAN_TRACK_ANALYSIS", None)
             os.environ.pop("WAN_TRACK_LATENT_SCALE", None)
+            os.environ.pop("TRACK_LATENT_FIRST_FRAME_SCALE", None)
+            os.environ.pop("TRACK_LATENT_REST_FRAME_SCALE", None)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.predict._append_track_analysis_summary(
@@ -502,7 +629,10 @@ def main() -> None:
     print(f"[worker] repo_root={REPO_ROOT}")
     print(f"[worker] jobs_root={jobs_root}")
     print(f"[worker] cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
+    print(f"[worker] track_condition_mode={args.track_condition_mode}")
     print(f"[worker] checkpoint={args.transformer_checkpoint_path}")
+    if args.track_condition_mode == "wan_move":
+        print(f"[worker] wan_move_temporal_stride={args.wan_move_temporal_stride}")
 
     runtime = TrackI2VPersistentRuntime(args)
     while True:

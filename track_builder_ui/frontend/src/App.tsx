@@ -5,7 +5,14 @@ import GenerationControls from "./components/GenerationControls";
 import QueuePanel from "./components/QueuePanel";
 import TrackCanvas from "./components/TrackCanvas";
 import TrackPreview from "./components/TrackPreview";
-import type { GenerationMode, GridConfig, JobRecord, TrackDocument, TrackPath } from "./types";
+import type {
+  GenerationMode,
+  GridConfig,
+  JobRecord,
+  RunnerConfig,
+  TrackDocument,
+  TrackPath
+} from "./types";
 
 const FRAME_COUNT = 81;
 const DEFAULT_IMAGE_WIDTH = 832;
@@ -13,6 +20,27 @@ const DEFAULT_IMAGE_HEIGHT = 480;
 const BACKEND_BASE_URL =
   (import.meta.env.VITE_BACKEND_URL as string | undefined)?.trim() ?? "";
 const DEFAULT_FLORENCE_TASK = "<MORE_DETAILED_CAPTION>";
+const FIRST_FRAME_EXAMPLES_STORAGE_KEY = "track_builder_first_frame_examples_v1";
+const MAX_FIRST_FRAME_EXAMPLES = 16;
+const STORED_FIRST_FRAME_MIME_TYPE = "image/jpeg";
+const STORED_FIRST_FRAME_QUALITY = 0.86;
+
+type FirstFrameExample = {
+  id: string;
+  name: string;
+  src: string;
+  width: number;
+  height: number;
+  createdAt: string;
+};
+
+type ResizedFirstFrameImage = {
+  src: string;
+  width: number;
+  height: number;
+  sourceWidth: number;
+  sourceHeight: number;
+};
 
 type TrackPackageArtifacts = {
   trackNpzBlob: Blob;
@@ -42,6 +70,56 @@ function generatePathId(): string {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function createFirstFrameExampleId(): string {
+  return `first-frame-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function isImageFile(file: File): boolean {
+  return (
+    file.type.startsWith("image/") ||
+    /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(file.name)
+  );
+}
+
+function normalizeExampleName(fileName: string): string {
+  const trimmed = fileName.replace(/\.[^.]+$/, "").trim();
+  return (trimmed || "First frame").slice(0, 48);
+}
+
+function isFirstFrameExample(value: unknown): value is FirstFrameExample {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.id === "string" &&
+    typeof entry.name === "string" &&
+    typeof entry.src === "string" &&
+    typeof entry.width === "number" &&
+    typeof entry.height === "number" &&
+    typeof entry.createdAt === "string"
+  );
+}
+
+function loadStoredFirstFrameExamples(): FirstFrameExample[] {
+  if (typeof window === "undefined") {
+    return [];
+  }
+  try {
+    const raw = window.localStorage.getItem(FIRST_FRAME_EXAMPLES_STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter(isFirstFrameExample).slice(0, MAX_FIRST_FRAME_EXAMPLES);
+  } catch {
+    return [];
+  }
 }
 
 function loadHtmlImage(src: string): Promise<HTMLImageElement> {
@@ -82,6 +160,47 @@ function drawCenterCropCover(
   }
 
   ctx.drawImage(source, sx, sy, sw, sh, 0, 0, width, height);
+}
+
+function resizeImageToFirstFrameDataUrl(
+  source: HTMLImageElement,
+  mimeType = "image/png",
+  quality?: number
+): ResizedFirstFrameImage {
+  const canvas = document.createElement("canvas");
+  canvas.width = DEFAULT_IMAGE_WIDTH;
+  canvas.height = DEFAULT_IMAGE_HEIGHT;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Failed to process image");
+  }
+
+  drawCenterCropCover(ctx, source, DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT);
+  return {
+    src: canvas.toDataURL(mimeType, quality),
+    width: DEFAULT_IMAGE_WIDTH,
+    height: DEFAULT_IMAGE_HEIGHT,
+    sourceWidth: source.width,
+    sourceHeight: source.height
+  };
+}
+
+async function processFirstFrameFile(
+  file: File,
+  mimeType = "image/png",
+  quality?: number
+): Promise<ResizedFirstFrameImage> {
+  if (!isImageFile(file)) {
+    throw new Error(`Skipped non-image file: ${file.name}`);
+  }
+
+  const tempObjectUrl = URL.createObjectURL(file);
+  try {
+    const original = await loadHtmlImage(tempObjectUrl);
+    return resizeImageToFirstFrameDataUrl(original, mimeType, quality);
+  } finally {
+    URL.revokeObjectURL(tempObjectUrl);
+  }
 }
 
 function createSquareGridPoints(
@@ -464,15 +583,23 @@ export default function App(): JSX.Element {
   const [serverExportPath, setServerExportPath] = useState<string>("/data/project-vilab/jaeseok/VideoX-Fun/asset/track_samples/");
   const [serverExportSubDir, setServerExportSubDir] = useState<string>("");
   const [localDownload, setLocalDownload] = useState<boolean>(true);
+  const [firstFrameExamples, setFirstFrameExamples] = useState<FirstFrameExample[]>(
+    () => loadStoredFirstFrameExamples()
+  );
+  const [isExampleDragOver, setIsExampleDragOver] = useState<boolean>(false);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("motion_only");
   const [generationPrompt, setGenerationPrompt] = useState<string>("a video");
   const [generationSeed, setGenerationSeed] = useState<number>(42);
   const [textGuidanceWeight, setTextGuidanceWeight] = useState<number>(0.0);
   const [motionGuidanceWeight, setMotionGuidanceWeight] = useState<number>(3.0);
+  const [trackLatentFirstFrameScale, setTrackLatentFirstFrameScale] = useState<number>(0.5);
+  const [trackLatentRestFrameScale, setTrackLatentRestFrameScale] = useState<number>(1.8);
   const [isQueueing, setIsQueueing] = useState<boolean>(false);
   const [jobs, setJobs] = useState<JobRecord[]>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [selectedJobLog, setSelectedJobLog] = useState<string>("");
+  const [runnerConfig, setRunnerConfig] = useState<RunnerConfig | null>(null);
+  const [runnerConfigError, setRunnerConfigError] = useState<string>("");
 
   useEffect(() => {
     if (image) {
@@ -520,6 +647,22 @@ export default function App(): JSX.Element {
     }
   };
 
+  const loadRunnerConfig = async (): Promise<void> => {
+    try {
+      const response = await fetch(buildApiUrl("/api/runner/config"));
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as { runner?: RunnerConfig };
+      setRunnerConfig(payload.runner ?? null);
+      setRunnerConfigError("");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unknown error";
+      setRunnerConfig(null);
+      setRunnerConfigError(reason);
+    }
+  };
+
   useEffect(() => {
     void loadJobs();
     const interval = window.setInterval(() => {
@@ -527,6 +670,26 @@ export default function App(): JSX.Element {
     }, 4000);
     return () => window.clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    void loadRunnerConfig();
+    const interval = window.setInterval(() => {
+      void loadRunnerConfig();
+    }, 10000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        FIRST_FRAME_EXAMPLES_STORAGE_KEY,
+        JSON.stringify(firstFrameExamples)
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unknown error";
+      setStatus(`Failed to save first-frame examples: ${reason}`);
+    }
+  }, [firstFrameExamples]);
 
   useEffect(() => {
     if (!selectedJobId) {
@@ -616,41 +779,24 @@ export default function App(): JSX.Element {
   }, [currentFrame]);
 
   const loadImageFile = async (file: File): Promise<void> => {
-    if (!file.type.startsWith("image/")) {
+    if (!isImageFile(file)) {
       setStatus(`Skipped non-image file: ${file.name}`);
       return;
     }
 
-    const tempObjectUrl = URL.createObjectURL(file);
     try {
-      const original = await loadHtmlImage(tempObjectUrl);
-      const canvas = document.createElement("canvas");
-      canvas.width = DEFAULT_IMAGE_WIDTH;
-      canvas.height = DEFAULT_IMAGE_HEIGHT;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) {
-        setStatus("Failed to process image");
-        return;
-      }
-
-      drawCenterCropCover(
-        ctx,
-        original,
-        DEFAULT_IMAGE_WIDTH,
-        DEFAULT_IMAGE_HEIGHT
-      );
-      const processedSrc = canvas.toDataURL("image/png");
-      const processedImage = await loadHtmlImage(processedSrc);
+      const processed = await processFirstFrameFile(file);
+      const processedImage = await loadHtmlImage(processed.src);
 
       if (activeObjectUrl) {
         URL.revokeObjectURL(activeObjectUrl);
         setActiveObjectUrl(null);
       }
       setImage(processedImage);
-      setImageSrc(processedSrc);
+      setImageSrc(processed.src);
       // setGeneratedCaption("");
       setStatus(
-        `Loaded and resized to ${DEFAULT_IMAGE_WIDTH}x${DEFAULT_IMAGE_HEIGHT} (source ${original.width}x${original.height})`
+        `Loaded and resized to ${DEFAULT_IMAGE_WIDTH}x${DEFAULT_IMAGE_HEIGHT} (source ${processed.sourceWidth}x${processed.sourceHeight})`
       );
     } catch (error) {
       setStatus(
@@ -658,9 +804,107 @@ export default function App(): JSX.Element {
           ? `Failed to load image: ${error.message}`
           : "Failed to load image"
       );
-    } finally {
-      URL.revokeObjectURL(tempObjectUrl);
     }
+  };
+
+  const loadFirstFrameExample = async (example: FirstFrameExample): Promise<void> => {
+    try {
+      const storedImage = await loadHtmlImage(example.src);
+      const processed = resizeImageToFirstFrameDataUrl(storedImage);
+      const processedImage = await loadHtmlImage(processed.src);
+
+      if (activeObjectUrl) {
+        URL.revokeObjectURL(activeObjectUrl);
+        setActiveObjectUrl(null);
+      }
+      setImage(processedImage);
+      setImageSrc(processed.src);
+      setStatus(`Loaded first-frame example: ${example.name}`);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unknown error";
+      setStatus(`Failed to load first-frame example: ${reason}`);
+    }
+  };
+
+  const addFirstFrameExampleFiles = async (
+    fileList: FileList | File[]
+  ): Promise<void> => {
+    const files = Array.from(fileList).filter(isImageFile);
+    if (files.length === 0) {
+      setStatus("Drop image files to save first-frame examples");
+      return;
+    }
+
+    const nextExamples: FirstFrameExample[] = [];
+    for (const file of files) {
+      try {
+        const processed = await processFirstFrameFile(
+          file,
+          STORED_FIRST_FRAME_MIME_TYPE,
+          STORED_FIRST_FRAME_QUALITY
+        );
+        nextExamples.push({
+          id: createFirstFrameExampleId(),
+          name: normalizeExampleName(file.name),
+          src: processed.src,
+          width: processed.width,
+          height: processed.height,
+          createdAt: nowIso()
+        });
+      } catch {
+        // Keep saving the rest of the dropped batch.
+      }
+    }
+
+    if (nextExamples.length === 0) {
+      setStatus("Failed to save first-frame examples");
+      return;
+    }
+
+    setFirstFrameExamples((prev) =>
+      [...nextExamples, ...prev].slice(0, MAX_FIRST_FRAME_EXAMPLES)
+    );
+    setStatus(
+      `Saved ${nextExamples.length} first-frame example${nextExamples.length === 1 ? "" : "s"}`
+    );
+  };
+
+  const saveCurrentAsFirstFrameExample = async (): Promise<void> => {
+    if (!imageSrc) {
+      setStatus("Load a first frame before saving an example");
+      return;
+    }
+
+    try {
+      const currentImage = await loadHtmlImage(imageSrc);
+      const processed = resizeImageToFirstFrameDataUrl(
+        currentImage,
+        STORED_FIRST_FRAME_MIME_TYPE,
+        STORED_FIRST_FRAME_QUALITY
+      );
+      setFirstFrameExamples((prev) =>
+        [
+          {
+            id: createFirstFrameExampleId(),
+            name: `Current ${new Date().toLocaleString()}`,
+            src: processed.src,
+            width: processed.width,
+            height: processed.height,
+            createdAt: nowIso()
+          },
+          ...prev
+        ].slice(0, MAX_FIRST_FRAME_EXAMPLES)
+      );
+      setStatus("Saved current first frame as an example");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unknown error";
+      setStatus(`Failed to save current first frame: ${reason}`);
+    }
+  };
+
+  const removeFirstFrameExample = (id: string, name: string): void => {
+    setFirstFrameExamples((prev) => prev.filter((example) => example.id !== id));
+    setStatus(`Removed first-frame example: ${name}`);
   };
 
   useEffect(() => {
@@ -677,6 +921,18 @@ export default function App(): JSX.Element {
       return;
     }
     await loadImageFile(file);
+  };
+
+  const onExampleUpload = async (
+    event: React.ChangeEvent<HTMLInputElement>
+  ): Promise<void> => {
+    const input = event.currentTarget;
+    const files = input.files;
+    if (!files?.length) {
+      return;
+    }
+    await addFirstFrameExampleFiles(files);
+    input.value = "";
   };
 
   const onCanvasDragOver = (event: React.DragEvent<HTMLElement>): void => {
@@ -703,6 +959,31 @@ export default function App(): JSX.Element {
       return;
     }
     await loadImageFile(file);
+  };
+
+  const onExampleDragOver = (event: React.DragEvent<HTMLElement>): void => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!isExampleDragOver) {
+      setIsExampleDragOver(true);
+    }
+  };
+
+  const onExampleDragLeave = (event: React.DragEvent<HTMLElement>): void => {
+    event.preventDefault();
+    event.stopPropagation();
+    const nextTarget = event.relatedTarget as Node | null;
+    if (nextTarget && event.currentTarget.contains(nextTarget)) {
+      return;
+    }
+    setIsExampleDragOver(false);
+  };
+
+  const onExampleDrop = async (event: React.DragEvent<HTMLElement>): Promise<void> => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsExampleDragOver(false);
+    await addFirstFrameExampleFiles(event.dataTransfer.files);
   };
 
   const deleteSelectedPath = (): void => {
@@ -1287,6 +1568,14 @@ export default function App(): JSX.Element {
       formData.append("seed", String(Number.isFinite(generationSeed) ? generationSeed : 42));
       formData.append("text_guidance_weight", String(textGuidanceWeight));
       formData.append("motion_guidance_weight", String(motionGuidanceWeight));
+      formData.append(
+        "track_latent_first_frame_scale",
+        String(Number.isFinite(trackLatentFirstFrameScale) ? trackLatentFirstFrameScale : 0.5)
+      );
+      formData.append(
+        "track_latent_rest_frame_scale",
+        String(Number.isFinite(trackLatentRestFrameScale) ? trackLatentRestFrameScale : 1.8)
+      );
 
       const response = await fetch(buildApiUrl("/api/jobs"), {
         method: "POST",
@@ -1362,6 +1651,33 @@ export default function App(): JSX.Element {
         error instanceof Error
           ? `Failed to retry job: ${error.message}`
           : "Failed to retry job"
+      );
+    }
+  };
+
+  const deleteArchivedJob = async (jobId: string): Promise<void> => {
+    if (!window.confirm(`Delete archived job ${jobId}?`)) {
+      return;
+    }
+    try {
+      const response = await fetch(buildApiUrl(`/api/jobs/${jobId}`), {
+        method: "DELETE"
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `HTTP ${response.status}`);
+      }
+      if (selectedJobId === jobId) {
+        setSelectedJobId(null);
+        setSelectedJobLog("");
+      }
+      setStatus(`Deleted archived job ${jobId}`);
+      await loadJobs();
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? `Failed to delete archived job: ${error.message}`
+          : "Failed to delete archived job"
       );
     }
   };
@@ -1550,6 +1866,67 @@ export default function App(): JSX.Element {
                 </div>
                 <div className="path-info">
                   Image: {image ? `${image.width}x${image.height}` : "None"}
+                </div>
+                <div className="example-library">
+                  <div className="example-library-header">
+                    <span>First Frame Examples</span>
+                    <div className="example-library-actions">
+                      <label className="btn compact">
+                        Add
+                        <input
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          onChange={onExampleUpload}
+                          hidden
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="compact-button"
+                        onClick={() => void saveCurrentAsFirstFrameExample()}
+                        disabled={!imageSrc}
+                      >
+                        Save Current
+                      </button>
+                    </div>
+                  </div>
+                  <div
+                    className={isExampleDragOver ? "example-drop active" : "example-drop"}
+                    onDragOver={onExampleDragOver}
+                    onDragEnter={onExampleDragOver}
+                    onDragLeave={onExampleDragLeave}
+                    onDrop={onExampleDrop}
+                  >
+                    Drop images here
+                  </div>
+                  {firstFrameExamples.length > 0 ? (
+                    <div className="example-grid" aria-label="Saved first-frame examples">
+                      {firstFrameExamples.map((example) => (
+                        <div className="example-item" key={example.id}>
+                          <button
+                            type="button"
+                            className="example-preview-button"
+                            onClick={() => void loadFirstFrameExample(example)}
+                            title={`Load ${example.name}`}
+                          >
+                            <img src={example.src} alt={example.name} draggable={false} />
+                            <span>{example.name}</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="example-remove"
+                            onClick={() => removeFirstFrameExample(example.id, example.name)}
+                            aria-label={`Remove ${example.name}`}
+                          >
+                            x
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="example-empty">No saved examples</div>
+                  )}
                 </div>
               {/* <label className="slider-field">
                 Florence Task Prompt
@@ -1743,6 +2120,10 @@ export default function App(): JSX.Element {
                 seed={generationSeed}
                 textGuidanceWeight={textGuidanceWeight}
                 motionGuidanceWeight={motionGuidanceWeight}
+                trackLatentFirstFrameScale={trackLatentFirstFrameScale}
+                trackLatentRestFrameScale={trackLatentRestFrameScale}
+                runnerConfig={runnerConfig}
+                runnerConfigError={runnerConfigError}
                 isQueueing={isQueueing}
                 canSubmit={canAddToQueue}
                 onModeChange={handleGenerationModeChange}
@@ -1750,6 +2131,8 @@ export default function App(): JSX.Element {
                 onSeedChange={setGenerationSeed}
                 onTextGuidanceWeightChange={setTextGuidanceWeight}
                 onMotionGuidanceWeightChange={setMotionGuidanceWeight}
+                onTrackLatentFirstFrameScaleChange={setTrackLatentFirstFrameScale}
+                onTrackLatentRestFrameScaleChange={setTrackLatentRestFrameScale}
                 onAddToQueue={() => void addCurrentToQueue()}
               />
 
@@ -1804,6 +2187,7 @@ export default function App(): JSX.Element {
             <ArchivePanel
               jobs={jobs}
               onRetry={(jobId) => void retryJob(jobId)}
+              onDelete={(jobId) => void deleteArchivedJob(jobId)}
               buildFileUrl={buildJobFileUrl}
             />
           </div>

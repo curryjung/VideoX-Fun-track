@@ -99,12 +99,85 @@ npm run dev -- --host 0.0.0.0 --port 5173
 
 > `run_track_i2v_worker_experimental.py`는 기존 `predict_i2v_track.py`를 수정하지 않고 helper를 import해서 사용하는 실험용 persistent worker입니다.
 
+### Wan-Move mode로 실행
+
+기본 generation backend는 `track_head` mode를 사용합니다. Wan-Move로 학습된 checkpoint를 쓰려면 `TRACK_BUILDER_TRACK_CONDITION_MODE=wan_move`를 지정하세요.
+
+#### Simple mode
+
+Backend subprocess가 직접 Wan-Move inference를 실행합니다.
+
+```bash
+cd /data/project-vilab/jaeseok/VideoX-Fun/track_builder_ui/backend
+source .venv/bin/activate
+
+TRACK_BUILDER_TRACK_CONDITION_MODE=wan_move \
+TRACK_BUILDER_CUDA_VISIBLE_DEVICES=6 \
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+#### Persistent worker mode
+
+Backend와 worker 양쪽에 같은 Wan-Move 설정을 넣어주세요. Frontend의 `4) Generation` 섹션은 backend의 `/api/runner/config` 값을 표시하므로, backend env와 worker env가 다르면 화면 표시와 실제 실행 모델이 달라질 수 있습니다.
+
+터미널 1 - Backend:
+
+```bash
+cd /data/project-vilab/jaeseok/VideoX-Fun/track_builder_ui/backend
+source .venv/bin/activate
+
+TRACK_BUILDER_RUNNER_MODE=external \
+TRACK_BUILDER_TRACK_CONDITION_MODE=wan_move \
+TRACK_BUILDER_CUDA_VISIBLE_DEVICES=6 \
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+터미널 2 - Persistent worker:
+
+```bash
+cd /data/project-vilab/jaeseok/VideoX-Fun
+source .venv-videoxfun/bin/activate
+TRACK_BUILDER_TRACK_CONDITION_MODE=wan_move \
+CUDA_VISIBLE_DEVICES=6 \
+python examples/wan2.1_fun_track/run_track_i2v_worker_experimental.py
+```
+
+Wan-Move 기본값은 `evaluation/davis_track_eval_wan_move.sh`와 맞춰져 있습니다.
+
+- 기본 checkpoint: `checkpoints/wan_track_wan_move_condition_bin8_train_78k_dropout_first-frame_0p1_text_0p1_track_0p1/checkpoint-11800`
+- 기본 `TRACK_BUILDER_WAN_MOVE_TEMPORAL_STRIDE`: `0` (`<=0`이면 VAE temporal compression ratio를 자동 사용)
+- 기본 track sampling: `TRACK_BUILDER_TRACK_MAX_POINTS=1500`, `TRACK_BUILDER_TRACK_POINT_SAMPLE_MODE=random`, `TRACK_BUILDER_TRACK_SORT_SELECTED_INDICES=true`, `TRACK_BUILDER_TRACK_POINT_ID_MODE=original`
+
+checkpoint를 직접 지정하려면 mode별 exp/ckpt env 또는 전체 경로 env를 사용하세요.
+
+```bash
+# mode별 exp/ckpt 지정
+TRACK_BUILDER_TRACK_CONDITION_MODE=wan_move \
+TRACK_BUILDER_WAN_MOVE_EXP_NAME=wan_track_wan_move_condition_bin8_train_78k_dropout_first-frame_0p1_text_0p1_track_0p1 \
+TRACK_BUILDER_WAN_MOVE_CKPT=11800 \
+...
+
+# 또는 checkpoint 디렉터리/파일 경로 직접 지정
+TRACK_BUILDER_TRACK_CONDITION_MODE=wan_move \
+TRACK_BUILDER_TRANSFORMER_CHECKPOINT_PATH=/data/project-vilab/jaeseok/VideoX-Fun/checkpoints/.../checkpoint-11800 \
+...
+```
+
 ### Generation 환경변수
 
 - `TRACK_BUILDER_CUDA_VISIBLE_DEVICES`: simple mode에서 backend subprocess가 사용할 GPU index. 기본값은 `6`.
 - `CUDA_VISIBLE_DEVICES`: persistent worker가 사용할 GPU index.
 - `TRACK_BUILDER_PYTHON_BIN`: simple mode에서 추론 subprocess에 사용할 Python.
+- `TRACK_BUILDER_TRACK_CONDITION_MODE`: track conditioning backend. `track_head` 또는 `wan_move`. 기본값은 `track_head`.
 - `TRACK_BUILDER_TRANSFORMER_CHECKPOINT_PATH`: 사용할 checkpoint 경로를 직접 지정.
+- `TRACK_BUILDER_EXP_NAME`, `TRACK_BUILDER_CKPT`: mode와 무관하게 checkpoint exp/ckpt를 override.
+- `TRACK_BUILDER_TRACK_HEAD_EXP_NAME`, `TRACK_BUILDER_TRACK_HEAD_CKPT`: `track_head` mode 전용 checkpoint exp/ckpt override.
+- `TRACK_BUILDER_WAN_MOVE_EXP_NAME`, `TRACK_BUILDER_WAN_MOVE_CKPT`: `wan_move` mode 전용 checkpoint exp/ckpt override.
+- `TRACK_BUILDER_WAN_MOVE_TEMPORAL_STRIDE`: Wan-Move track frame을 latent frame에 매핑할 temporal stride. 기본값은 `0`이며 자동 설정.
+- `TRACK_BUILDER_TRACK_MAX_POINTS`: inference에 사용할 track point 수. 기본값은 `track_head=2000`, `wan_move=1500`.
+- `TRACK_BUILDER_TRACK_POINT_SAMPLE_MODE`: point sampling 방식. `random` 또는 `uniform`. 기본값은 `random`.
+- `TRACK_BUILDER_TRACK_SORT_SELECTED_INDICES`: random sampling 후 원래 index 순서 정렬 여부. 기본값은 `track_head=false`, `wan_move=true`.
+- `TRACK_BUILDER_TRACK_POINT_ID_MODE`: point id 부여 방식. 기본값은 `track_head=local`, `wan_move=original`.
 - `TRACK_BUILDER_JOBS_ROOT`: job/archive 저장 루트. 기본값은 `asset/track_builder_jobs`.
 
 ## 빠른 사용 순서

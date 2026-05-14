@@ -6,6 +6,7 @@ taming*
 samples*
 datasets*
 asset*
+evaluation/results*
 _*
 logs*
 __pycache__/
@@ -137,6 +138,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.venv-videoxfun/
 
 # Spyder project settings
 .spyderproject

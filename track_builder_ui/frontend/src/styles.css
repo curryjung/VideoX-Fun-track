@@ -113,11 +113,165 @@ body {
   background: #161019;
 }
 
+.runner-config {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-bottom: 2px;
+}
+
+.runner-config-row {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.runner-config-label {
+  color: #8ea0bd;
+}
+
+.runner-config-value {
+  min-width: 0;
+  overflow: hidden;
+  color: #dce7fb;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runner-config-value.monospace {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
 .control-row {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.example-library {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #253247;
+}
+
+.example-library-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #c9d8f2;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.example-library-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.btn.compact,
+.compact-button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.example-drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  width: 100%;
+  padding: 8px;
+  border: 1px dashed #3c4d6a;
+  border-radius: 6px;
+  background: #0d1420;
+  color: #8ea0bd;
+  text-align: center;
+  font-size: 12px;
+}
+
+.example-drop.active {
+  border-color: #00d7ff;
+  background: #122b3a;
+  color: #dff8ff;
+}
+
+.example-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  max-height: 210px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.example-item {
+  position: relative;
+  min-width: 0;
+}
+
+.example-preview-button {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  width: 100%;
+  min-height: 0;
+  padding: 4px;
+  overflow: hidden;
+  text-align: left;
+}
+
+.example-preview-button img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 832 / 480;
+  object-fit: cover;
+  border-radius: 4px;
+  background: #050911;
+}
+
+.example-preview-button span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: #dce7fb;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.example-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  min-height: 22px;
+  padding: 0;
+  border-color: rgba(255, 255, 255, 0.2);
+  background: rgba(6, 10, 18, 0.82);
+  color: #f1f5ff;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.example-empty {
+  padding: 8px;
+  border: 1px solid #253247;
+  border-radius: 6px;
+  color: #798aa5;
+  text-align: center;
+  font-size: 12px;
 }
 
 .track-list {

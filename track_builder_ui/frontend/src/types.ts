@@ -41,6 +41,21 @@ export type EditorTool = "pointCloudEdit";
 
 export type GenerationMode = "motion_only" | "text_only" | "joint_tm";
 
+export type TrackConditionMode = "track_head" | "wan_move";
+
+export type RunnerConfig = {
+  runner_mode: string;
+  track_condition_mode: TrackConditionMode;
+  transformer_checkpoint_path: string;
+  checkpoint_label: string;
+  cuda_visible_devices: string;
+  wan_move_temporal_stride: string;
+  track_max_points: string;
+  track_point_sample_mode: string;
+  track_sort_selected_indices: string;
+  track_point_id_mode: string;
+};
+
 export type JobStatus =
   | "queued"
   | "running"
@@ -57,6 +72,8 @@ export type JobRecord = {
   seed: number;
   text_guidance_weight: number;
   motion_guidance_weight: number;
+  track_latent_first_frame_scale: number;
+  track_latent_rest_frame_scale: number;
   created_at: string;
   started_at?: string | null;
   finished_at?: string | null;

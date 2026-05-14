@@ -31,6 +31,10 @@ function shortPrompt(prompt: string): string {
   return `${trimmed.slice(0, 72)}...`;
 }
 
+function scaleLabel(job: JobRecord): string {
+  return `f${job.track_latent_first_frame_scale} / r${job.track_latent_rest_frame_scale}`;
+}
+
 export default function QueuePanel({
   jobs,
   selectedJobId,
@@ -73,7 +77,9 @@ export default function QueuePanel({
                 />
               ) : null}
               <span className="job-main">
-                <span className="job-title">{modeLabel(job.mode)} / seed {job.seed}</span>
+                <span className="job-title">
+                  {modeLabel(job.mode)} / seed {job.seed} / scale {scaleLabel(job)}
+                </span>
                 <span className="job-subtitle">{shortPrompt(job.prompt)}</span>
               </span>
               <span className={`status-pill ${job.status}`}>{statusLabel(job.status)}</span>

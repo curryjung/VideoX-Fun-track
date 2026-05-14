@@ -1,4 +1,5 @@
 import io
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,13 @@ def _default_guidance_weights(mode: str) -> tuple[float, float]:
     return 0.0, 3.0
 
 
+def _validate_nonnegative_finite(name: str, value: float) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise HTTPException(status_code=400, detail=f"{name} must be finite and >= 0")
+    return parsed
+
+
 def _get_florence_runtime() -> tuple[Any, Any, str, Any]:
     global _caption_model, _caption_processor, _caption_device, _caption_dtype
 
@@ -121,6 +129,14 @@ def _extract_caption_text(parsed_answer: Any) -> str:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/runner/config")
+def runner_config() -> dict:
+    try:
+        return {"runner": job_runner.config_snapshot()}
+    except ValueError as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
 
 
 @app.post("/api/images/upload")
@@ -219,9 +235,19 @@ async def create_generation_job(
     seed: int = Form(42),
     text_guidance_weight: float | None = Form(default=None),
     motion_guidance_weight: float | None = Form(default=None),
+    track_latent_first_frame_scale: float = Form(0.5),
+    track_latent_rest_frame_scale: float = Form(1.8),
 ) -> dict:
     normalized_mode = _normalize_generation_mode(mode)
     default_text_weight, default_motion_weight = _default_guidance_weights(normalized_mode)
+    first_frame_scale = _validate_nonnegative_finite(
+        "track_latent_first_frame_scale",
+        track_latent_first_frame_scale,
+    )
+    rest_frame_scale = _validate_nonnegative_finite(
+        "track_latent_rest_frame_scale",
+        track_latent_rest_frame_scale,
+    )
     image_bytes = await image.read()
     tracks_bytes = await tracks_npz.read()
     preview_bytes = await preview_png.read() if preview_png is not None else None
@@ -246,6 +272,8 @@ async def create_generation_job(
         motion_guidance_weight=(
             default_motion_weight if motion_guidance_weight is None else motion_guidance_weight
         ),
+        track_latent_first_frame_scale=first_frame_scale,
+        track_latent_rest_frame_scale=rest_frame_scale,
     )
     job_runner.notify()
     return {"job": job}
@@ -295,6 +323,17 @@ def retry_generation_job(job_id: str) -> dict:
         raise HTTPException(status_code=404, detail=str(error)) from error
     job_runner.notify()
     return {"job": job}
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_generation_job(job_id: str) -> dict:
+    try:
+        job_store.delete_archived_job(job_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Job not found") from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"deleted": True, "job_id": job_id}
 
 
 @app.get("/api/jobs/{job_id}/file/{file_path:path}")

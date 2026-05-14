@@ -52,6 +52,8 @@ PDB_PIPELINE_STEP0="${PDB_PIPELINE_STEP0:-false}"
 FORCE_TRACK_CONDITION_NONE="${FORCE_TRACK_CONDITION_NONE:-false}"
 RANDOM_FAKE_TRACK="${RANDOM_FAKE_TRACK:-false}"
 TRACK_LATENT_SCALE="${TRACK_LATENT_SCALE:-1.0}"
+TRACK_CONDITION_MODE="${TRACK_CONDITION_MODE:-track_head}"
+WAN_MOVE_TEMPORAL_STRIDE="${WAN_MOVE_TEMPORAL_STRIDE:-}"
 TRACK_LATENT_FIRST_FRAME_SCALE="${TRACK_LATENT_FIRST_FRAME_SCALE:-}"
 TRACK_LATENT_REST_FRAME_SCALE="${TRACK_LATENT_REST_FRAME_SCALE:-}"
 TRACK_HEAD_HIDDEN_DIM="${TRACK_HEAD_HIDDEN_DIM:-}"
@@ -117,6 +119,8 @@ echo "[trace_exec] track_analysis=${TRACK_ANALYSIS}"
 echo "[trace_exec] force_track_condition_none=${FORCE_TRACK_CONDITION_NONE}"
 echo "[trace_exec] random_fake_track=${RANDOM_FAKE_TRACK}"
 echo "[trace_exec] track_latent_scale=${TRACK_LATENT_SCALE}"
+echo "[trace_exec] track_condition_mode=${TRACK_CONDITION_MODE}"
+echo "[trace_exec] wan_move_temporal_stride=${WAN_MOVE_TEMPORAL_STRIDE:-<auto>}"
 echo "[trace_exec] track_latent_first_frame_scale=${TRACK_LATENT_FIRST_FRAME_SCALE:-<track_latent_scale>}"
 echo "[trace_exec] track_latent_rest_frame_scale=${TRACK_LATENT_REST_FRAME_SCALE:-<track_latent_scale>}"
 echo "[trace_exec] track_head_hidden_dim=${TRACK_HEAD_HIDDEN_DIM:-<config>}"
@@ -215,8 +219,14 @@ fi
 if [[ "${RANDOM_FAKE_TRACK}" == "true" ]]; then
   EXTRA_ARGS+=("--random_fake_track")
 fi
-if [[ -n "${TRACK_LATENT_SCALE}" ]]; then
+if [[ "${TRACK_CONDITION_MODE}" == "track_head" && -n "${TRACK_LATENT_SCALE}" ]]; then
   EXTRA_ARGS+=("--track_latent_scale=${TRACK_LATENT_SCALE}")
+fi
+if [[ -n "${TRACK_CONDITION_MODE}" ]]; then
+  EXTRA_ARGS+=("--track_condition_mode=${TRACK_CONDITION_MODE}")
+fi
+if [[ -n "${WAN_MOVE_TEMPORAL_STRIDE}" ]]; then
+  EXTRA_ARGS+=("--wan_move_temporal_stride=${WAN_MOVE_TEMPORAL_STRIDE}")
 fi
 if [[ -n "${TRACK_LATENT_FIRST_FRAME_SCALE}" ]]; then
   export TRACK_LATENT_FIRST_FRAME_SCALE
@@ -224,7 +234,7 @@ fi
 if [[ -n "${TRACK_LATENT_REST_FRAME_SCALE}" ]]; then
   export TRACK_LATENT_REST_FRAME_SCALE
 fi
-if [[ -n "${TRACK_HEAD_HIDDEN_DIM}" ]]; then
+if [[ "${TRACK_CONDITION_MODE}" == "track_head" && -n "${TRACK_HEAD_HIDDEN_DIM}" ]]; then
   EXTRA_ARGS+=("--track_head_hidden_dim=${TRACK_HEAD_HIDDEN_DIM}")
 fi
 if [[ -n "${TRACK_CONDITION_INDEX_OFFSET}" ]]; then

@@ -5,6 +5,7 @@ import os
 import random
 import sys
 import tempfile
+import types
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -29,6 +30,7 @@ from videox_fun.models import (  # noqa: E402
     AutoencoderKLWan,
     CLIPModel,
     WanT5EncoderModel,
+    WanTransformer3DModel,
     WanTransformer3DModelTrack,
 )
 from videox_fun.pipeline import WanFunInpaintPipeline  # noqa: E402
@@ -960,6 +962,241 @@ def _make_random_fake_track_condition(
     return fake
 
 
+def _as_batched_bool_hint(
+    value: Optional[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    hint = (
+        value.to(device=device)
+        if isinstance(value, torch.Tensor)
+        else torch.as_tensor(value, device=device)
+    )
+    if hint.ndim == 0:
+        hint = hint.view(1)
+    if hint.ndim != 1:
+        raise ValueError(f"is_normalized must be scalar or [B], got {tuple(hint.shape)}")
+    if hint.shape[0] == 1 and batch_size > 1:
+        hint = hint.expand(batch_size)
+    if hint.shape[0] != batch_size:
+        raise ValueError(f"is_normalized batch {hint.shape[0]} != tracks batch {batch_size}")
+    return hint.to(dtype=torch.bool)
+
+
+def _as_batched_track_resolution(
+    value: Optional[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    resolution = (
+        value.to(device=device, dtype=torch.float32)
+        if isinstance(value, torch.Tensor)
+        else torch.as_tensor(value, device=device, dtype=torch.float32)
+    )
+    if resolution.ndim == 1:
+        resolution = resolution.unsqueeze(0)
+    if resolution.ndim != 2 or resolution.shape[-1] < 2:
+        raise ValueError(
+            f"track_resolution must be [B,2] or [2], got {tuple(resolution.shape)}"
+        )
+    resolution = resolution[:, :2]
+    if resolution.shape[0] == 1 and batch_size > 1:
+        resolution = resolution.expand(batch_size, -1)
+    if resolution.shape[0] != batch_size:
+        raise ValueError(
+            f"track_resolution batch {resolution.shape[0]} != tracks batch {batch_size}"
+        )
+    return resolution
+
+
+def _map_wan_move_tracks_to_latent_grid(
+    tracks: torch.Tensor,
+    h_lat: int,
+    w_lat: int,
+    is_normalized_hint: Optional[torch.Tensor],
+    track_resolution: Optional[torch.Tensor],
+) -> torch.Tensor:
+    bsz = int(tracks.shape[0])
+    device = tracks.device
+    x = tracks[..., 0]
+    y = tracks[..., 1]
+
+    hint = _as_batched_bool_hint(is_normalized_hint, bsz, device=device)
+    if hint is None:
+        is_normalized_batch = torch.full(
+            (bsz,),
+            bool((tracks.max() <= 2.0).item() and (tracks.min() >= -0.5).item()),
+            device=device,
+            dtype=torch.bool,
+        )
+    else:
+        is_normalized_batch = hint
+
+    resolution = _as_batched_track_resolution(track_resolution, bsz, device=device)
+    if resolution is None:
+        src_w = torch.clamp(x.amax(dim=(1, 2)).view(-1, 1, 1), min=1.0)
+        src_h = torch.clamp(y.amax(dim=(1, 2)).view(-1, 1, 1), min=1.0)
+    else:
+        src_w = torch.clamp(resolution[:, 0].view(-1, 1, 1), min=1.0)
+        src_h = torch.clamp(resolution[:, 1].view(-1, 1, 1), min=1.0)
+
+    gx_norm = torch.floor(x * float(max(w_lat, 1)))
+    gy_norm = torch.floor(y * float(max(h_lat, 1)))
+    gx_pixel = torch.floor(x / src_w * float(max(w_lat, 1)))
+    gy_pixel = torch.floor(y / src_h * float(max(h_lat, 1)))
+
+    norm_mask = is_normalized_batch.view(-1, 1, 1)
+    gx = torch.where(norm_mask, gx_norm, gx_pixel)
+    gy = torch.where(norm_mask, gy_norm, gy_pixel)
+    return torch.stack([gx, gy], dim=-1).long()
+
+
+def _apply_wan_move_feature_replace(
+    condition_latents: torch.Tensor,
+    track_condition: Optional[Dict[str, torch.Tensor]],
+    temporal_stride: int,
+) -> torch.Tensor:
+    if track_condition is None:
+        return condition_latents
+
+    tracks = track_condition.get("tracks", None)
+    visibility = track_condition.get("visibility", None)
+    if tracks is None or visibility is None:
+        return condition_latents
+
+    device = condition_latents.device
+    bsz, _, latent_frames, h_lat, w_lat = condition_latents.shape
+    tracks = tracks.to(device=device, dtype=torch.float32)
+    visibility = visibility.to(device=device, dtype=torch.float32)
+    if tracks.ndim != 4 or tracks.shape[-1] != 2:
+        raise ValueError(f"tracks must be [B,T,P,2], got {tuple(tracks.shape)}")
+    if visibility.ndim != 3:
+        raise ValueError(f"visibility must be [B,T,P], got {tuple(visibility.shape)}")
+    if tracks.shape[0] != bsz:
+        raise ValueError(
+            f"Batch mismatch between condition latents ({bsz}) and tracks ({tracks.shape[0]})."
+        )
+    if visibility.shape[:3] != tracks.shape[:3]:
+        raise ValueError(
+            "tracks/visibility shape mismatch: "
+            f"tracks={tuple(tracks.shape)} visibility={tuple(visibility.shape)}"
+        )
+
+    if latent_frames <= 1:
+        return condition_latents
+
+    point_mask = track_condition.get("point_mask", None)
+    if point_mask is None:
+        point_mask = torch.ones((bsz, tracks.shape[2]), device=device, dtype=torch.bool)
+    else:
+        point_mask = point_mask.to(device=device, dtype=torch.bool)
+        if point_mask.shape != (bsz, tracks.shape[2]):
+            raise ValueError(f"point_mask must be [B,P], got {tuple(point_mask.shape)}")
+
+    stride = max(1, int(temporal_stride))
+    frame_idx = torch.arange(latent_frames, device=device, dtype=torch.long) * stride
+    frame_idx = torch.clamp(frame_idx, max=max(int(tracks.shape[1]) - 1, 0))
+
+    sampled_tracks = tracks.index_select(1, frame_idx)
+    sampled_visibility = visibility.index_select(1, frame_idx) > 0.5
+    grid_xy = _map_wan_move_tracks_to_latent_grid(
+        sampled_tracks,
+        h_lat=h_lat,
+        w_lat=w_lat,
+        is_normalized_hint=track_condition.get("is_normalized", None),
+        track_resolution=track_condition.get("track_resolution", None),
+    )
+    gx = grid_xy[..., 0]
+    gy = grid_xy[..., 1]
+    in_bound = (gx >= 0) & (gx < w_lat) & (gy >= 0) & (gy < h_lat)
+    valid = sampled_visibility & in_bound & point_mask[:, None, :]
+
+    source_valid = valid[:, 0, :]
+    target_valid = valid[:, 1:, :] & source_valid[:, None, :]
+    valid_indices = target_valid.nonzero(as_tuple=False)
+    if valid_indices.numel() == 0:
+        return condition_latents
+
+    edited = condition_latents.clone()
+    batch_idx = valid_indices[:, 0]
+    t_rel = valid_indices[:, 1]
+    point_idx = valid_indices[:, 2]
+    t_target = t_rel + 1
+
+    h_target = gy[batch_idx, t_target, point_idx].long()
+    w_target = gx[batch_idx, t_target, point_idx].long()
+    h_source = gy[batch_idx, 0, point_idx].long()
+    w_source = gx[batch_idx, 0, point_idx].long()
+
+    src_features = edited[batch_idx, :, 0, h_source, w_source]
+    edited[batch_idx, :, t_target, h_target, w_target] = src_features
+    return edited
+
+
+def _attach_wan_move_forward_adapter(
+    transformer: WanTransformer3DModel,
+    latent_channels: int,
+    temporal_stride: int,
+) -> None:
+    base_forward = transformer.forward
+    latent_channels = int(latent_channels)
+    temporal_stride = int(max(1, temporal_stride))
+
+    def _forward_with_wan_move(
+        self,
+        x,
+        t,
+        context,
+        seq_len,
+        clip_fea=None,
+        y=None,
+        y_camera=None,
+        full_ref=None,
+        subject_ref=None,
+        cond_flag=True,
+        track_condition: Optional[Dict[str, torch.Tensor]] = None,
+    ):
+        y_input = y
+        if y_input is not None and track_condition is not None:
+            if y_input.ndim != 5:
+                raise ValueError(f"Expected y to be 5D [B,C,F,H,W], got {tuple(y_input.shape)}")
+            if y_input.shape[1] < latent_channels:
+                raise ValueError(
+                    f"y channels {y_input.shape[1]} smaller than latent_channels={latent_channels}"
+                )
+            y_track = y_input[:, -latent_channels:, :, :, :]
+            y_track_wan_move = _apply_wan_move_feature_replace(
+                condition_latents=y_track,
+                track_condition=track_condition,
+                temporal_stride=temporal_stride,
+            )
+            if y_track_wan_move is not y_track:
+                y_input = y_input.clone()
+                y_input[:, -latent_channels:, :, :, :] = y_track_wan_move
+
+        return base_forward(
+            x=x,
+            t=t,
+            context=context,
+            seq_len=seq_len,
+            clip_fea=clip_fea,
+            y=y_input,
+            y_camera=y_camera,
+            full_ref=full_ref,
+            subject_ref=subject_ref,
+            cond_flag=cond_flag,
+        )
+
+    transformer.forward = types.MethodType(_forward_with_wan_move, transformer)
+    setattr(transformer, "_wan_move_adapter_enabled", True)
+    setattr(transformer, "_wan_move_temporal_stride", temporal_stride)
+    setattr(transformer, "_wan_move_latent_channels", latent_channels)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Wan2.1 Fun Track i2v inference")
     parser.add_argument(
@@ -1233,6 +1470,25 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Inference-only scale factor applied to track latent before concat.",
     )
+    parser.add_argument(
+        "--track_condition_mode",
+        type=str,
+        default="track_head",
+        choices=["track_head", "wan_move"],
+        help=(
+            "track_head uses the track-head transformer checkpoint; "
+            "wan_move uses base Wan transformer and applies Wan-Move latent copy by tracks."
+        ),
+    )
+    parser.add_argument(
+        "--wan_move_temporal_stride",
+        type=int,
+        default=0,
+        help=(
+            "Temporal stride for mapping video-track frames to latent frames in wan_move mode. "
+            "<=0 uses VAE temporal_compression_ratio."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1266,7 +1522,9 @@ def main() -> None:
             f"force_track_condition_none={args.force_track_condition_none} "
             f"random_fake_track={args.random_fake_track} "
             f"track_latent_scale={args.track_latent_scale} "
-            f"track_head_hidden_dim={args.track_head_hidden_dim}"
+            f"track_head_hidden_dim={args.track_head_hidden_dim} "
+            f"track_condition_mode={args.track_condition_mode} "
+            f"wan_move_temporal_stride={args.wan_move_temporal_stride}"
         ),
     )
 
@@ -1284,13 +1542,27 @@ def main() -> None:
     config = OmegaConf.load(args.config_path)
 
     transformer_additional_kwargs = OmegaConf.to_container(config["transformer_additional_kwargs"])
-    if args.track_head_hidden_dim is not None:
-        if int(args.track_head_hidden_dim) <= 0:
-            raise ValueError("--track_head_hidden_dim must be > 0 when provided.")
-        transformer_additional_kwargs["track_head_hidden_dim"] = int(args.track_head_hidden_dim)
-    transformer_additional_kwargs["track_latent_scale"] = float(args.track_latent_scale)
+    if args.track_condition_mode == "track_head":
+        if args.track_head_hidden_dim is not None:
+            if int(args.track_head_hidden_dim) <= 0:
+                raise ValueError("--track_head_hidden_dim must be > 0 when provided.")
+            transformer_additional_kwargs["track_head_hidden_dim"] = int(args.track_head_hidden_dim)
+        transformer_additional_kwargs["track_latent_scale"] = float(args.track_latent_scale)
+        transformer_cls = WanTransformer3DModelTrack
+    else:
+        transformer_cls = WanTransformer3DModel
+        if args.track_head_hidden_dim is not None:
+            print(
+                "[warn] --track_head_hidden_dim is ignored when "
+                "--track_condition_mode=wan_move."
+            )
+        if float(args.track_latent_scale) != 1.0:
+            print(
+                "[warn] --track_latent_scale is only used by track_head mode; "
+                "wan_move mode ignores it."
+            )
 
-    transformer = WanTransformer3DModelTrack.from_pretrained(
+    transformer = transformer_cls.from_pretrained(
         os.path.join(
             args.model_name,
             config["transformer_additional_kwargs"].get("transformer_subpath", "transformer"),
@@ -1329,6 +1601,20 @@ def main() -> None:
         ),
         additional_kwargs=OmegaConf.to_container(config["vae_kwargs"]),
     ).to(weight_dtype)
+    if args.track_condition_mode == "wan_move":
+        wan_move_temporal_stride = int(args.wan_move_temporal_stride)
+        if wan_move_temporal_stride <= 0:
+            wan_move_temporal_stride = int(getattr(vae.config, "temporal_compression_ratio", 4))
+        _attach_wan_move_forward_adapter(
+            transformer=transformer,
+            latent_channels=int(getattr(vae.config, "latent_channels", 16)),
+            temporal_stride=wan_move_temporal_stride,
+        )
+        print(
+            "[info] wan_move adapter enabled: "
+            f"latent_channels={int(getattr(vae.config, 'latent_channels', 16))} "
+            f"temporal_stride={wan_move_temporal_stride}"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(
         os.path.join(
